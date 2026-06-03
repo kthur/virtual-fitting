@@ -76,6 +76,8 @@ def build_prompt(base_prompt, garment_type, fit_type, colors, materials, styles)
         feature_parts.append(f"{materials} fabric")
     if styles:
         feature_parts.append(styles)
+        if "short sleeve" in styles.lower() or "반소매" in styles.lower():
+            feature_parts.append("showing bare forearms, bare skin arms, short sleeves")
     feature_str = ", ".join(feature_parts) if feature_parts else ""
 
     full = f"a person wearing {base_prompt}"
@@ -84,11 +86,15 @@ def build_prompt(base_prompt, garment_type, fit_type, colors, materials, styles)
     full += f", {fit_text}"
     full += ", high quality, photorealistic, 8k, detailed fabric texture, natural lighting, fashion photography"
 
-    negative = (
-        "deformed, bad anatomy, ugly, blurry, low quality, distorted, extra limbs, "
-        "mutated hands, fused fingers, missing fingers, watermark, duplicate, "
+    neg_parts = [
+        "deformed, bad anatomy, ugly, blurry, low quality, distorted, extra limbs",
+        "mutated hands, fused fingers, missing fingers, watermark, duplicate",
         "bad proportions, extra arms, unnatural body, cartoon, drawing, painted"
-    )
+    ]
+    if garment_type == "upper" or garment_type is None:
+        neg_parts.append("long sleeves, suit, jacket, tie, collar, white shirt, undershirt, necktie, business suit")
+
+    negative = ", ".join(neg_parts)
     return full, negative
 
 
@@ -145,7 +151,7 @@ def generate_clothing_mask(segmentation_model, processor, person_img_resized,
     mask_blurred = cv2.GaussianBlur(mask_dilated, (11, 11), 0)
 
     print(f"[AI] Mask coverage: {(mask_blurred > 0).sum()} / {mask_blurred.size} px")
-    return mask_blurred, pred_seg
+    return mask_dilated, mask_blurred, pred_seg
 
 
 def blend_result_with_original(original_pil, result_pil, soft_mask_np, pred_seg):
@@ -223,10 +229,15 @@ def main():
 
     print("[AI] Generating clothing mask...")
     try:
-        mask_np, pred_seg = generate_clothing_mask(
+        mask_dilated, mask_blurred, pred_seg = generate_clothing_mask(
             seg_model, seg_processor, person_resized,
             target_w, target_h, args.garment_type, device)
-        mask_image = Image.fromarray(mask_np)
+        mask_image = Image.fromarray(mask_blurred)
+        
+        # Dilate mask_dilated slightly for the blending phase so that it overlaps
+        # with skin boundaries, completely covering the original white shirt collar.
+        kernel_blend = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_blend = cv2.dilate(mask_dilated, kernel_blend, iterations=1)
     except Exception as e:
         print(f"[AI] [ERROR] Mask generation failed: {e}")
         return
@@ -287,7 +298,8 @@ def main():
             generator=generator
         ).images[0]
 
-        print("[AI] Synthesis complete. Blending with original...")
+        print("[AI] Synthesis complete. Saving debug SD output and blending with original...")
+        result_resized.save("debug_sd_output.png")
     except Exception as e:
         print(f"[AI] [ERROR] Inference failed: {e}")
         return
@@ -307,10 +319,10 @@ def main():
     # Resize all components to output size
     person_out = person_img.resize((out_w, out_h), Image.Resampling.LANCZOS)
     result_out  = result_resized.resize((out_w, out_h), Image.Resampling.LANCZOS)
-    # Resize mask to match (use the raw dilated mask, not blurred, to avoid leaking into face)
-    mask_out = cv2.resize(mask_np, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+    # Resize mask to match (use the dilated blend mask to cover original collar edge)
+    mask_out = cv2.resize(mask_blend, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
     # Smooth edges of the resized mask
-    mask_out = cv2.GaussianBlur(mask_out, (15, 15), 0)
+    mask_out = cv2.GaussianBlur(mask_out, (5, 5), 0)
 
     # Composite: original face/skin + AI clothing
     final_img = blend_result_with_original(person_out, result_out, mask_out, pred_seg)
