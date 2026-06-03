@@ -10,6 +10,7 @@ require('dotenv').config();
 const VENV_PYTHON = path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe');
 
 const { determineGarmentType, extractFeatures } = require('./helpers');
+const sizeScraper = require('./size_scraper');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -102,9 +103,112 @@ app.post('/api/scrape', async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────
+// 사이즈 표 스크래퍼 엔드포인트 (무신사/지그재그/29cm)
+// body: { url: string, garmentType?: 'upper'|'lower'|'outer'|'full' }
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/scrape-size', async (req, res) => {
+  const { url, garmentType } = req.body;
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+
+  try {
+    const mall = sizeScraper.detectMall(url);
+    if (!mall) {
+      return res.status(400).json({
+        error: '지원하지 않는 쇼핑몰입니다. (무신사/지그재그/29cm)'
+      });
+    }
+
+    let chart;
+    if (mall === 'musinsa') chart = await sizeScraper.scrapeMusinsaSize(url);
+    else if (mall === 'zigzag') chart = await sizeScraper.scrapeZigzagSize(url);
+    else if (mall === '29cm')  chart = await sizeScraper.scrape29cmSize(url);
+
+    res.json({ mall, url, garmentType: garmentType || 'upper', sizeChart: chart });
+  } catch (error) {
+    console.error('Size scraping error:', error.message);
+    res.status(500).json({ error: '사이즈 표를 가져오지 못했습니다: ' + error.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 사이즈 추천 엔드포인트
+// body: { url, userBody: { height, weight, shoulder, chest, waist, hip, thigh }, garmentType? }
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/recommend-size', async (req, res) => {
+  const { url, userBody, garmentType } = req.body;
+  if (!url)      return res.status(400).json({ error: 'URL is required' });
+  if (!userBody) return res.status(400).json({ error: 'userBody is required' });
+
+  try {
+    const result = await sizeScraper.fetchAndRecommend(url, userBody, garmentType || 'upper');
+    res.json(result);
+  } catch (error) {
+    console.error('Recommend size error:', error.message);
+    res.status(500).json({ error: '사이즈 추천 실패: ' + error.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// 신체 사이즈 자동 추정 (사진 -> 비율 -> cm)
+// body: { userImageBase64, knownHeightCm? }
+// ─────────────────────────────────────────────────────────────────
+app.post('/api/estimate-body', async (req, res) => {
+  const { userImageBase64, knownHeightCm } = req.body;
+  if (!userImageBase64) {
+    return res.status(400).json({ error: 'userImageBase64 is required' });
+  }
+
+  const tempUserPath = path.join(__dirname, `temp_body_${Date.now()}.jpg`);
+
+  try {
+    const base64Data = userImageBase64.replace(/^data:image\/\w+;base64,/, "");
+    fs.writeFileSync(tempUserPath, base64Data, 'base64');
+
+    const scriptPath = path.join(__dirname, 'estimate_body.py');
+    const args = [scriptPath, '--image_path', tempUserPath];
+    if (knownHeightCm) args.push('--known_height_cm', String(knownHeightCm));
+
+    const { spawn } = require('child_process');
+    const py = spawn(VENV_PYTHON, args, {
+      cwd: __dirname,
+      env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }
+    });
+
+    let stdout = '', stderr = '';
+    py.stdout.on('data', d => stdout += d.toString());
+    py.stderr.on('data', d => stderr += d.toString());
+
+    const exitCode = await new Promise(resolve => py.on('close', resolve));
+    if (exitCode !== 0) {
+      throw new Error(`estimate_body.py failed: ${stderr}`);
+    }
+
+    // stdout 마지막 줄 = JSON 결과
+    const lines = stdout.trim().split(/\r?\n/);
+    const jsonLine = lines.reverse().find(l => l.trim().startsWith('{'));
+    if (!jsonLine) {
+      throw new Error('No JSON output from estimate_body.py');
+    }
+    const result = JSON.parse(jsonLine);
+    res.json(result);
+  } catch (error) {
+    console.error('[Server] estimate-body error:', error);
+    res.status(500).json({ error: '신체 추정 실패: ' + error.message });
+  } finally {
+    try { if (fs.existsSync(tempUserPath)) fs.unlinkSync(tempUserPath); } catch (_) {}
+  }
+});
+
 // High-Quality Local AI Try-On
 app.post('/api/tryon', async (req, res) => {
-  const { userImageBase64, clothingImageUrl, garmentDescription, garmentType, fitType, features } = req.body;
+  const {
+    userImageBase64, clothingImageUrl,
+    garmentDescription, garmentType, fitType, features,
+    ipScale, inferenceSteps, upscale
+  } = req.body;
   if (!userImageBase64 || !clothingImageUrl) {
     return res.status(400).json({ error: 'Missing required images.' });
   }
@@ -148,6 +252,10 @@ app.post('/api/tryon', async (req, res) => {
       if (features.materials) args.push('--materials', features.materials);
       if (features.styles)    args.push('--styles',    features.styles);
     }
+    // Optional v3 quality knobs (all optional - safe defaults)
+    if (ipScale !== undefined && ipScale !== null)        args.push('--ip_scale', String(ipScale));
+    if (inferenceSteps !== undefined && inferenceSteps)   args.push('--inference_steps', String(inferenceSteps));
+    if (upscale) args.push('--upscale');
 
     const pythonProcess = spawn(VENV_PYTHON, args, {
       cwd: __dirname,
