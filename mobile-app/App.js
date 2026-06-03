@@ -20,6 +20,9 @@ export default function App() {
   const [scrapedImages, setScrapedImages] = useState([]);
   const [selectedClothingImage, setSelectedClothingImage] = useState(null);
   const [garmentDescription, setGarmentDescription] = useState('');
+  const [garmentType, setGarmentType] = useState('upper');
+  const [fitType, setFitType] = useState('regular');
+  const [features, setFeatures] = useState({});
   
   const [finalImage, setFinalImage] = useState(null);
 
@@ -27,7 +30,7 @@ export default function App() {
     let result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: true,
-      quality: 0.8,
+      quality: 0.5,
       base64: true,
     });
 
@@ -51,15 +54,18 @@ export default function App() {
         { timeout: 15000, headers: { 'Bypass-Tunnel-Reminder': 'true' } }
       );
 
-      const { imageUrls, garmentDescription: scrapedDesc } = scrapeRes.data;
+      const { imageUrls, garmentDescription: scrapedDesc, garmentType: scrapedType, features: scrapedFeatures } = scrapeRes.data;
       
       if (!imageUrls || imageUrls.length === 0) {
         throw new Error('옷 이미지를 찾을 수 없습니다.');
       }
 
       setScrapedImages(imageUrls);
-      setSelectedClothingImage(imageUrls[0]); // default to first image
+      setSelectedClothingImage(imageUrls[0]);
       setGarmentDescription(scrapedDesc || '');
+      setGarmentType(scrapedType || 'upper');
+      setFeatures(scrapedFeatures || {});
+      setFitType('regular');
       setStep('IMAGE_SELECTION');
       
     } catch (error) {
@@ -75,9 +81,12 @@ export default function App() {
       const tryonRes = await axios.post(`${BACKEND_URL}/api/tryon`, {
         userImageBase64: userPhotoBase64,
         clothingImageUrl: selectedClothingImage,
-        garmentDescription: garmentDescription
+        garmentDescription: garmentDescription,
+        garmentType: garmentType,
+        fitType: fitType,
+        features: features,
       }, {
-        timeout: 120000,
+        timeout: 300000, // 5분 (AI 합성 평균 2~3분 소요)
         headers: { 'Bypass-Tunnel-Reminder': 'true' },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
@@ -193,6 +202,28 @@ export default function App() {
             onChangeText={setGarmentDescription}
           />
 
+          <Text style={[styles.title, { marginTop: 16, fontSize: 20 }]}>핏 선택 옵션</Text>
+          <Text style={styles.subtitle}>원하는 피팅 스타일을 선택하세요</Text>
+          <View style={styles.fitRow}>
+            {['slim', 'regular', 'overfit'].map((fit) => (
+              <TouchableOpacity
+                key={fit}
+                style={[
+                  styles.fitButton,
+                  fitType === fit && styles.selectedFitButton
+                ]}
+                onPress={() => setFitType(fit)}
+              >
+                <Text style={[
+                  styles.fitButtonText,
+                  fitType === fit && styles.selectedFitButtonText
+                ]}>
+                  {fit === 'slim' ? '🧘 슬림핏' : fit === 'overfit' ? '🧥 오버핏' : '👕 정사이즈'}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
           <View style={styles.buttonRow}>
             <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={() => setStep('INPUT_URL')}>
               <Text style={styles.buttonText}>← 뒤로</Text>
@@ -215,7 +246,7 @@ export default function App() {
           <Text style={styles.loadingTitle}>AI가 프롬프트를 분석 중...</Text>
           <Text style={styles.loadingSubtitle}>
             "{garmentDescription.substring(0, 30)}{garmentDescription.length > 30 ? '...' : ''}"{'\n'}
-            정보를 바탕으로 완벽한 핏을 만들고 있습니다. (30~60초 소요)
+            정보를 바탕으로 완벽한 핏을 만들고 있습니다. (2~3분 소요)
           </Text>
         </View>
       )}
@@ -268,4 +299,9 @@ const styles = StyleSheet.create({
   carousel: { width: '100%', maxHeight: 150, marginVertical: 10 },
   carouselImage: { width: 100, height: 130, borderRadius: 8, marginRight: 12, borderWidth: 2, borderColor: 'transparent', opacity: 0.5 },
   selectedImage: { borderColor: '#FF6B6B', opacity: 1 },
+  fitRow: { flexDirection: 'row', justifyContent: 'space-between', width: '100%', marginBottom: 12 },
+  fitButton: { flex: 1, backgroundColor: '#1A1A1A', paddingVertical: 12, borderRadius: 10, alignItems: 'center', marginHorizontal: 4, borderWidth: 1, borderColor: '#333' },
+  selectedFitButton: { backgroundColor: '#FF6B6B', borderColor: '#FF6B6B' },
+  fitButtonText: { color: '#888', fontSize: 13, fontWeight: '600' },
+  selectedFitButtonText: { color: '#FFF' },
 });

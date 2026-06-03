@@ -9,6 +9,77 @@ require('dotenv').config();
 // Path to the venv python with AI dependencies installed
 const VENV_PYTHON = path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe');
 
+function determineGarmentType(title, desc) {
+  const text = `${title} ${desc}`.toLowerCase();
+  const fullKeywords = ['원피스', '드레스', '점프수트', '점프슈트', 'onepiece', 'one-piece', 'dress', 'jumpsuit'];
+  if (fullKeywords.some(kw => text.includes(kw))) return 'full';
+  const lowerKeywords = ['바지', '팬츠', '데님', '청바지', '스커트', '치마', '슬랙스', '레깅스', '반바지', '숏팬츠', 'pants', 'skirt', 'jeans', 'denim', 'slacks', 'shorts', 'trouser', 'trousers'];
+  if (lowerKeywords.some(kw => text.includes(kw))) return 'lower';
+  const outerKeywords = ['자켓', '재킷', '코트', '가디건', '패딩', '점퍼', '아우터', '가죽', '라이더', '블레이저', '무스탕', 'jacket', 'coat', 'cardigan', 'jumper', 'outer', 'blazer', 'parka', 'windbreaker'];
+  if (outerKeywords.some(kw => text.includes(kw))) return 'outer';
+  return 'upper';
+}
+
+/**
+ * Extract visual features (color, material, style) from product title + description.
+ * These are passed as prompt hints to the AI model for more accurate generation.
+ */
+function extractFeatures(title, desc) {
+  const text = `${title} ${desc}`.toLowerCase();
+
+  // Color keywords (Korean + English)
+  const colorMap = {
+    '블랙': 'black', '화이트': 'white', '네이비': 'navy blue', '그레이': 'gray',
+    '베이지': 'beige', '멜란지': 'melange gray', '아이보리': 'ivory', '카키': 'khaki',
+    '브라운': 'brown', '레드': 'red', '블루': 'blue', '그린': 'green',
+    '옐로우': 'yellow', '핑크': 'pink', '퍼플': 'purple', '오렌지': 'orange',
+    'black': 'black', 'white': 'white', 'navy': 'navy blue', 'gray': 'gray',
+    'grey': 'gray', 'beige': 'beige', 'melange': 'melange gray', 'ivory': 'ivory',
+    'khaki': 'khaki', 'brown': 'brown', 'blue': 'blue', 'green': 'green',
+  };
+
+  // Material keywords
+  const materialMap = {
+    '면': 'cotton', '코튼': 'cotton', '린넨': 'linen', '니트': 'knit', '울': 'wool',
+    '폴리': 'polyester', '와플': 'waffle-knit', '캐시미어': 'cashmere',
+    '스웨이드': 'suede', '데님': 'denim', '가죽': 'leather', '시폰': 'chiffon',
+    'cotton': 'cotton', 'linen': 'linen', 'knit': 'knit', 'wool': 'wool',
+    'waffle': 'waffle-knit', 'denim': 'denim', 'leather': 'leather',
+    'polyester': 'polyester', 'cashmere': 'cashmere',
+  };
+
+  // Style keywords
+  const styleMap = {
+    '오버핏': 'oversized', '오버사이즈': 'oversized', '슬림': 'slim fit',
+    '루즈': 'loose fit', '크롭': 'cropped', '박시': 'boxy', '스트릿': 'streetwear',
+    '캐주얼': 'casual', '헨리넥': 'henley neck', '브이넥': 'v-neck',
+    '라운드넥': 'round neck', '터틀넥': 'turtleneck', '후드': 'hoodie',
+    '반소매': 'short sleeve', '긴소매': 'long sleeve', '민소매': 'sleeveless',
+    'oversize': 'oversized', 'slim': 'slim fit', 'crop': 'cropped',
+    'boxy': 'boxy', 'henley': 'henley neck', 'hoodie': 'hoodie',
+  };
+
+  const foundColors = [];
+  const foundMaterials = [];
+  const foundStyles = [];
+
+  for (const [kw, val] of Object.entries(colorMap)) {
+    if (text.includes(kw) && !foundColors.includes(val)) foundColors.push(val);
+  }
+  for (const [kw, val] of Object.entries(materialMap)) {
+    if (text.includes(kw) && !foundMaterials.includes(val)) foundMaterials.push(val);
+  }
+  for (const [kw, val] of Object.entries(styleMap)) {
+    if (text.includes(kw) && !foundStyles.includes(val)) foundStyles.push(val);
+  }
+
+  return {
+    colors: foundColors.join(', '),
+    materials: foundMaterials.join(', '),
+    styles: foundStyles.join(', '),
+  };
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -81,11 +152,18 @@ app.post('/api/scrape', async (req, res) => {
     }
 
     // 3. Extract description (Title + Meta description)
+    // Use just the page title as the garment description - short and clean for CLIP's 77-token limit
+    // Strip the site name " | 무신사" suffix if present
     const title = $('title').text().trim();
     const metaDesc = $('meta[name="description"]').attr('content') || '';
-    const garmentDescription = `${title} ${metaDesc}`.substring(0, 200).trim();
+    const productName = title.replace(/\s*[-|]\s*(무신사|musinsa).*$/i, '').trim();
+    const garmentDescription = productName.substring(0, 120);
+    const garmentType = determineGarmentType(title, metaDesc);
+    const features = extractFeatures(title, metaDesc);
+    console.log(`[Server] Product: ${garmentDescription}`);
+    console.log(`[Server] Features: colors='${features.colors}' materials='${features.materials}' styles='${features.styles}'`);
 
-    res.json({ imageUrls, garmentDescription, sourceUrl: url });
+    res.json({ imageUrls, garmentDescription, garmentType, features, sourceUrl: url });
 
   } catch (error) {
     console.error('Scraping error:', error.message);
@@ -95,14 +173,14 @@ app.post('/api/scrape', async (req, res) => {
 
 // High-Quality Local AI Try-On
 app.post('/api/tryon', async (req, res) => {
-  const { userImageBase64, clothingImageUrl, garmentDescription } = req.body;
+  const { userImageBase64, clothingImageUrl, garmentDescription, garmentType, fitType, features } = req.body;
   if (!userImageBase64 || !clothingImageUrl) {
     return res.status(400).json({ error: 'Missing required images.' });
   }
 
   const tempUserPath = path.join(__dirname, `temp_user_${Date.now()}.png`);
   const tempGarmentPath = path.join(__dirname, `temp_garment_${Date.now()}.png`);
-  const tempOutputPath = path.join(__dirname, `temp_output_${Date.now()}.png`);
+  const tempOutputPath = path.join(__dirname, `temp_output_${Date.now()}.jpg`);
 
   try {
     // 1. Decode base64 user image and save to temp file
@@ -123,13 +201,31 @@ app.post('/api/tryon', async (req, res) => {
     const tryonScriptPath = path.join(__dirname, 'tryon_local.py');
     console.log(`[Server] Spawning local AI process: ${VENV_PYTHON} ${tryonScriptPath}`);
     const { spawn } = require('child_process');
-    const pythonProcess = spawn(VENV_PYTHON, [
+    
+    const args = [
       tryonScriptPath,
       '--person_path', tempUserPath,
       '--garment_path', tempGarmentPath,
       '--output_path', tempOutputPath,
       '--prompt', garmentDescription || 'a garment'
-    ], { cwd: __dirname });
+    ];
+    if (garmentType) args.push('--garment_type', garmentType);
+    if (fitType)     args.push('--fit_type', fitType);
+    // Pass extracted visual features for richer prompt
+    if (features) {
+      if (features.colors)    args.push('--colors',    features.colors);
+      if (features.materials) args.push('--materials', features.materials);
+      if (features.styles)    args.push('--styles',    features.styles);
+    }
+
+    const pythonProcess = spawn(VENV_PYTHON, args, {
+      cwd: __dirname,
+      env: {
+        ...process.env,
+        PYTHONUTF8: '1',            // Force UTF-8 mode (Python 3.7+)
+        PYTHONIOENCODING: 'utf-8',  // Fallback: force UTF-8 for stdin/stdout/stderr
+      }
+    });
 
     let stdoutLogs = '';
     let stderrLogs = '';
@@ -163,7 +259,7 @@ app.post('/api/tryon', async (req, res) => {
 
     const outputBuffer = fs.readFileSync(tempOutputPath);
     const base64Output = outputBuffer.toString('base64');
-    const resultImageUrl = `data:image/png;base64,${base64Output}`;
+    const resultImageUrl = `data:image/jpeg;base64,${base64Output}`;
 
     res.json({ resultImageUrl });
 

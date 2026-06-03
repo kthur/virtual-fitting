@@ -1,0 +1,76 @@
+{
+  "product_id": "4990664",
+  "source_url": "https://www.musinsa.com/products/4990664",
+  "brand": "드로우핏",
+  "name": "와플 헨리넥 하프 티셔츠 [MELANGE]",
+  "category": "상의 > 반소매 티셔츠",
+  "price": 30600,
+  "garment_type": "upper",
+  "image_url": "https://image.msscdn.net/images/goods_img/20250404/4990664/4990664_17785477325284_500.jpg",
+  "garment_description": "드로우핏 와플 헨리넥 하프 티셔츠 [MELANGE]",
+  "features": {
+    "colors": "melange gray",
+    "materials": "와플",
+    "styles": "헨리넥, 반소매"
+  },
+  "detail_images": [
+    "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17785477367276_500.jpg",
+    "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17785477109277_500.jpg",
+    "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628233413_500.jpg",
+    "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628241733_500.jpg",
+    "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628250581_500.jpg"
+  ],
+  "model_spec": {
+    "height": "186 cm",
+    "weight": "68 kg",
+    "fitting_size": "L"
+  },
+  "size_chart": {
+    "M": {
+      "shoulder": "50.5 cm",
+      "chest": "55.5 cm",
+      "sleeve": "23 cm",
+      "length": "70 cm"
+    },
+    "L": {
+      "shoulder": "52 cm",
+      "chest": "58 cm",
+      "sleeve": "24 cm",
+      "length": "72 cm"
+    },
+    "XL": {
+      "shoulder": "53.5 cm",
+      "chest": "60.5 cm",
+      "sleeve": "25 cm",
+      "length": "74 cm"
+    }
+  },
+  "motion_poses": [
+    {
+      "image_idx": 1,
+      "url": "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17785477367276_500.jpg",
+      "pose": "정면 서 있는 포즈 (Standing Front Pose)"
+    },
+    {
+      "image_idx": 2,
+      "url": "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17785477109277_500.jpg",
+      "pose": "우측 45도 측면 포즈 (Standing 3/4 Right Pose)"
+    },
+    {
+      "image_idx": 3,
+      "url": "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628233413_500.jpg",
+      "pose": "정면 클로즈업 포즈 (Front Close-up Pose)"
+    },
+    {
+      "image_idx": 4,
+      "url": "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628241733_500.jpg",
+      "pose": "좌측 측면 포즈 (Left Profile Pose)"
+    },
+    {
+      "image_idx": 5,
+      "url": "https://image.msscdn.net/images/prd_img/20250404/4990664/detail_4990664_17442628250581_500.jpg",
+      "pose": "원단 질감 및 헨리넥 디테일 컷 (Detail Fabric Pose)"
+    }
+  ],
+  "scraped_at": "2026-06-03"
+}

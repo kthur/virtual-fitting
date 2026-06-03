@@ -39,3 +39,17 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# Python venv
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Local AI Temp/Test Outputs
+backend/temp_*
+backend/test_output.*
+backend/test_user_output.*
+backend/test_api_output.png
+resource/
+2.6.0
