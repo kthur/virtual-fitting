@@ -5,7 +5,9 @@ import {
   KeyboardAvoidingView, Platform
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import { Image as ExpoImage } from 'expo-image';
 import axios from 'axios';
+import { preprocessUserPhoto, assessPhotoQuality } from './src/vision/imagePreprocess';
 
 const BACKEND_URL = 'http://192.168.31.231:3000';
 
@@ -27,6 +29,7 @@ export default function App() {
   // 사용자 사진
   const [userPhoto, setUserPhoto] = useState(null);
   const [userPhotoBase64, setUserPhotoBase64] = useState('');
+  const [photoQuality, setPhotoQuality] = useState(null);
 
   // 사용자 신체 정보 (cm, kg)
   const [userBody, setUserBody] = useState({
@@ -50,7 +53,7 @@ export default function App() {
   const [finalImage, setFinalImage] = useState(null);
   const [useUpscale, setUseUpscale] = useState(false);
 
-  // ───────── 사진 선택 ─────────
+  // ───────── 사진 선택 (EXIF 보정 + 리사이즈) ─────────
   const pickImage = async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
@@ -64,9 +67,22 @@ export default function App() {
       base64: true,
     });
     if (!result.canceled) {
-      setUserPhoto(result.assets[0].uri);
-      setUserPhotoBase64(`data:image/jpeg;base64,${result.assets[0].base64}`);
-      setStep(STEPS.INPUT_BODY);
+      try {
+        const processed = await preprocessUserPhoto(result.assets[0].uri);
+        setUserPhoto(processed.uri);
+        setUserPhotoBase64(processed.dataUri);
+        setPhotoQuality(processed.quality);
+
+        if (processed.quality.issues.length) {
+          const hard = processed.quality.issues.find(i => i.severity === 'warn');
+          if (hard) {
+            Alert.alert('사진 품질 안내', hard.message, [{ text: '계속' }]);
+          }
+        }
+        setStep(STEPS.INPUT_BODY);
+      } catch (e) {
+        Alert.alert('사진 처리 실패', e.message || '이미지를 정규화하지 못했습니다.');
+      }
     }
   };
 
@@ -261,7 +277,15 @@ export default function App() {
         {/* ───── STEP 2: 신체 사이즈 입력 ───── */}
         {step === STEPS.INPUT_BODY && (
           <ScrollView contentContainerStyle={styles.scrollCenter} keyboardShouldPersistTaps="handled">
-            <Image source={{ uri: userPhoto }} style={styles.thumbnail} />
+            <ExpoImage source={{ uri: userPhoto }} style={styles.thumbnail} />
+            {photoQuality && (
+              <Text style={styles.photoMeta}>
+                📐 {photoQuality.width}×{photoQuality.height} px · EXIF 보정됨
+                {photoQuality.issues.length > 0 && (
+                  <Text style={{ color: '#FFB347' }}> · {photoQuality.issues[0].message}</Text>
+                )}
+              </Text>
+            )}
             <Text style={styles.title}>신체 사이즈를 알려주세요</Text>
             <Text style={styles.subtitle}>
               {bodyEstimated ? '✅ 사진으로 자동 추정했어요. 수정하고 싶은 부분만 바꿔주세요.' : '키를 입력하면 사진에서 자동으로 추정할 수 있어요.'}
@@ -315,7 +339,7 @@ export default function App() {
         {/* ───── STEP 3: URL 입력 ───── */}
         {step === STEPS.INPUT_URL && (
           <ScrollView contentContainerStyle={styles.scrollCenter} keyboardShouldPersistTaps="handled">
-            <Image source={{ uri: userPhoto }} style={styles.thumbnail} />
+            <ExpoImage source={{ uri: userPhoto }} style={styles.thumbnail} />
             <Text style={styles.title}>어떤 옷을 입어볼까요?</Text>
             <Text style={styles.subtitle}>무신사 · 지그재그 · 29cm URL을 붙여넣으세요</Text>
             <TextInput
@@ -414,7 +438,7 @@ export default function App() {
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.carousel}>
               {scrapedImages.map((imgUrl, index) => (
                 <TouchableOpacity key={index} onPress={() => setSelectedClothingImage(imgUrl)}>
-                  <Image source={{ uri: imgUrl }}
+                  <ExpoImage source={{ uri: imgUrl }}
                     style={[styles.carouselImage, selectedClothingImage === imgUrl && styles.selectedImage]} />
                 </TouchableOpacity>
               ))}
@@ -468,9 +492,9 @@ export default function App() {
         {step === STEPS.AI_FITTING && (
           <View style={styles.centerContainer}>
             <View style={styles.fittingPreview}>
-              <Image source={{ uri: userPhoto }} style={styles.previewSmall} />
+              <ExpoImage source={{ uri: userPhoto }} style={styles.previewSmall} />
               <Text style={styles.plusSign}>+</Text>
-              <Image source={{ uri: selectedClothingImage }} style={styles.previewSmall} />
+              <ExpoImage source={{ uri: selectedClothingImage }} style={styles.previewSmall} />
             </View>
             <ActivityIndicator size="large" color="#FF6B6B" style={{ marginTop: 24 }} />
             <Text style={styles.loadingTitle}>AI가 옷을 입히는 중...</Text>
@@ -485,7 +509,7 @@ export default function App() {
           <View style={styles.resultContainer}>
             <Text style={styles.resultTitle}>✨ 피팅 완료!</Text>
             <View style={styles.resultImageWrap}>
-              <Image source={{ uri: finalImage }} style={styles.resultImage} resizeMode="contain" />
+              <ExpoImage source={{ uri: finalImage }} style={styles.resultImage} contentFit="contain" />
             </View>
             <View style={styles.buttonRow}>
               <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={resetAll}>
@@ -570,6 +594,7 @@ const styles = StyleSheet.create({
 
   input: { width: '100%', backgroundColor: '#1A1A1A', color: '#FFF', padding: 16, borderRadius: 14, borderWidth: 1, borderColor: '#333', fontSize: 14, marginBottom: 12 },
   thumbnail: { width: 90, height: 90, borderRadius: 45, marginBottom: 20, borderWidth: 2, borderColor: '#4D96FF' },
+  photoMeta: { fontSize: 11, color: '#888', marginBottom: 12, textAlign: 'center' },
 
   loadingTitle: { color: '#FFFFFF', marginTop: 20, fontSize: 18, fontWeight: '600', textAlign: 'center' },
   loadingSubtitle: { color: '#888', marginTop: 8, fontSize: 14, textAlign: 'center', lineHeight: 22 },

@@ -7,7 +7,26 @@ import cv2
 from PIL import Image
 import torch.nn.functional as F
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+
+# Patch huggingface_hub.cached_download to avoid ImportError with newer versions
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "cached_download"):
+        def dummy_cached_download(*args, **kwargs):
+            return huggingface_hub.hf_hub_download(*args, **kwargs)
+        huggingface_hub.cached_download = dummy_cached_download
+except ImportError:
+    pass
+
 from diffusers import StableDiffusionInpaintPipeline
+
+
+try:
+    import mediapipe as mp
+    mp_pose = mp.solutions.pose
+except ImportError:
+    mp = None
+    mp_pose = None
 
 # SegFormer LIP label map (from model config)
 # 0: Background, 1: Hat, 2: Hair, 3: Sunglasses, 4: Upper-clothes
@@ -18,8 +37,8 @@ from diffusers import StableDiffusionInpaintPipeline
 # Region that MUST never be inpainted (skin, face, hair, limbs).
 # Keeping face/skin in this set ensures the deepfake illusion: the
 # person is preserved at the pixel level; only clothing changes.
-PRESERVE_LABELS = {2, 9, 10, 11, 12, 13, 14, 15}  # Hair, shoes, face, legs, arms/hands
-BACKGROUND_LABEL = 0                                # Background - never mask
+DEFAULT_PRESERVE_LABELS = {2, 9, 10, 11, 12, 13, 14, 15}  # Hair, shoes, face, legs, arms/hands
+BACKGROUND_LABEL = 0                                     # Background - never mask
 
 
 def parse_args():
@@ -104,7 +123,7 @@ def build_prompt(base_prompt, garment_type, fit_type, colors, materials, styles)
     return full, negative
 
 
-def build_face_protect_mask(person_pil, seg_model, seg_processor, device, w, h):
+def build_face_protect_mask(person_pil, seg_model, seg_processor, device, w, h, lm=None, garment_type=None):
     """
     Build a mask of the FACE region that should NEVER be inpainted.
     This mask is binary (0 or 255). 255 = preserve, 0 = safe to change.
@@ -119,19 +138,109 @@ def build_face_protect_mask(person_pil, seg_model, seg_processor, device, w, h):
     upsampled = F.interpolate(outputs.logits, size=(h, w), mode="bilinear", align_corners=False)
     pred = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
 
+    # Reclassify white collar misclassified as Face (11) to Upper-clothes (4)
+    if lm is not None:
+        mouth_y = (lm[9].y + lm[10].y) / 2.0
+        mouth_y_px = int(mouth_y * h)
+        y_indices = np.arange(h).reshape(h, 1)
+        white_mask = (arr[:, :, 0] > 190) & (arr[:, :, 1] > 190) & (arr[:, :, 2] > 190) & (np.abs(arr[:, :, 0].astype(np.int32) - arr[:, :, 2].astype(np.int32)) < 22)
+        pred[(pred == 11) & (y_indices >= mouth_y_px) & white_mask] = 4
+
     # Face (11) + hair (2) + neck skin (sometimes mis-classed) + a small safety margin
     face_mask = np.zeros((h, w), dtype=np.uint8)
     face_mask[pred == 11] = 255
     face_mask[pred == 2]  = 255
-    # Dilate to add safety margin around face/hair
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
-    face_mask = cv2.dilate(face_mask, k, iterations=2)
+
+    if lm is not None:
+        # Reduce the face mask dilation kernel (use a smaller ellipse kernel like (11, 11) with 1 iteration)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        face_mask = cv2.dilate(face_mask, k, iterations=1)
+        
+        # Calculate chin Y
+        mouth_y = (lm[9].y + lm[10].y) / 2.0
+        nose_y = lm[0].y
+        chin_y = mouth_y + 1.2 * (mouth_y - nose_y)
+        chin_y_px = int(chin_y * h)
+        
+        # Zero out the face mask below chin_y_px within the neck corridor (between ear X)
+        ear_l_x = int(lm[7].x * w)
+        ear_r_x = int(lm[8].x * w)
+        x1 = min(ear_l_x, ear_r_x)
+        x2 = max(ear_l_x, ear_r_x)
+        
+        x1_clip = max(0, x1)
+        x2_clip = min(w, x2)
+        chin_y_clip = max(0, min(h, chin_y_px))
+        face_mask[chin_y_clip:, x1_clip:x2_clip] = 0
+        
+        g_type = garment_type or "upper"
+        # Hand protection (for 'upper', 'outer', 'full')
+        if g_type in ["upper", "outer", "full"]:
+            left_hand_pts = np.array([
+                [int(lm[15].x * w), int(lm[15].y * h)],
+                [int(lm[17].x * w), int(lm[17].y * h)],
+                [int(lm[19].x * w), int(lm[19].y * h)],
+                [int(lm[21].x * w), int(lm[21].y * h)]
+            ], dtype=np.int32)
+            right_hand_pts = np.array([
+                [int(lm[16].x * w), int(lm[16].y * h)],
+                [int(lm[18].x * w), int(lm[18].y * h)],
+                [int(lm[20].x * w), int(lm[20].y * h)],
+                [int(lm[22].x * w), int(lm[22].y * h)]
+            ], dtype=np.int32)
+            
+            hand_mask = np.zeros((h, w), dtype=np.uint8)
+            hull_left = cv2.convexHull(left_hand_pts)
+            cv2.drawContours(hand_mask, [hull_left], -1, 255, -1)
+            hull_right = cv2.convexHull(right_hand_pts)
+            cv2.drawContours(hand_mask, [hull_right], -1, 255, -1)
+            
+            k_hand = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            hand_mask = cv2.dilate(hand_mask, k_hand, iterations=1)
+            
+            # Add to face protection mask
+            face_mask = cv2.bitwise_or(face_mask, hand_mask)
+            
+        # Feet protection (for 'lower', 'full')
+        if g_type in ["lower", "full"]:
+            left_foot_pts = np.array([
+                [int(lm[27].x * w), int(lm[27].y * h)],
+                [int(lm[29].x * w), int(lm[29].y * h)],
+                [int(lm[31].x * w), int(lm[31].y * h)]
+            ], dtype=np.int32)
+            right_foot_pts = np.array([
+                [int(lm[28].x * w), int(lm[28].y * h)],
+                [int(lm[30].x * w), int(lm[30].y * h)],
+                [int(lm[32].x * w), int(lm[32].y * h)]
+            ], dtype=np.int32)
+            
+            foot_mask = np.zeros((h, w), dtype=np.uint8)
+            hull_left_foot = cv2.convexHull(left_foot_pts)
+            cv2.drawContours(foot_mask, [hull_left_foot], -1, 255, -1)
+            hull_right_foot = cv2.convexHull(right_foot_pts)
+            cv2.drawContours(foot_mask, [hull_right_foot], -1, 255, -1)
+            
+            k_foot = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+            foot_mask = cv2.dilate(foot_mask, k_foot, iterations=1)
+            
+            # Add to face protection mask
+            face_mask = cv2.bitwise_or(face_mask, foot_mask)
+    else:
+        # Dilate to add safety margin around face/hair
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        face_mask = cv2.dilate(face_mask, k, iterations=2)
+        
+    # Ensure no clothing pixels are protected by the face mask
+    for label in [4, 5, 6, 7, 8, 17]:
+        face_mask[pred == label] = 0
+        
     face_mask = cv2.GaussianBlur(face_mask, (15, 15), 0)
     return face_mask, pred
 
 
 def generate_clothing_mask(seg_model, seg_processor, person_resized,
-                           target_w, target_h, garment_type, device):
+                           target_w, target_h, garment_type, device,
+                           preserve_labels, lm=None):
     """
     Clothing mask = ONLY the clothing pixels.  Face, skin, hair, limbs, background are all
     explicitly zeroed out. The dilation step is corrected by re-applying PRESERVE.
@@ -144,6 +253,15 @@ def generate_clothing_mask(seg_model, seg_processor, person_resized,
     upsampled = F.interpolate(logits, size=(target_h, target_w),
                               mode="bilinear", align_corners=False)
     pred_seg = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+
+    # Reclassify white collar misclassified as Face (11) to Upper-clothes (4)
+    if lm is not None:
+        mouth_y = (lm[9].y + lm[10].y) / 2.0
+        mouth_y_px = int(mouth_y * target_h)
+        person_np = np.array(person_resized)
+        y_indices = np.arange(target_h).reshape(target_h, 1)
+        white_mask = (person_np[:, :, 0] > 190) & (person_np[:, :, 1] > 190) & (person_np[:, :, 2] > 190) & (np.abs(person_np[:, :, 0].astype(np.int32) - person_np[:, :, 2].astype(np.int32)) < 22)
+        pred_seg[(pred_seg == 11) & (y_indices >= mouth_y_px) & white_mask] = 4
 
     g_type = garment_type or "upper"
     if g_type == "lower":
@@ -162,18 +280,42 @@ def generate_clothing_mask(seg_model, seg_processor, person_resized,
         mask_np[pred_seg == label] = 255
 
     # Explicitly ZERO OUT face, skin, limbs
-    for label in PRESERVE_LABELS:
+    for label in preserve_labels:
         mask_np[pred_seg == label] = 0
+
+    # Dynamic Neck Collar Masking: Neck trapezoid polygon
+    neck_mask = None
+    if lm is not None:
+        neck_mask = np.zeros(pred_seg.shape, dtype=np.uint8)
+        mouth_y = (lm[9].y + lm[10].y) / 2.0
+        nose_y = lm[0].y
+        chin_y = mouth_y + 1.2 * (mouth_y - nose_y)
+        chin_y_px = int(chin_y * target_h)
+        
+        pt1 = (int(lm[9].x * target_w), chin_y_px)
+        pt2 = (int(lm[10].x * target_w), chin_y_px)
+        pt3 = (int(lm[12].x * target_w), int(lm[12].y * target_h))
+        pt4 = (int(lm[11].x * target_w), int(lm[11].y * target_h))
+        
+        pts = np.array([pt1, pt2, pt3, pt4], dtype=np.int32)
+        cv2.fillPoly(neck_mask, [pts], 255)
+        
+        # Merge it into the base clothing mask
+        mask_np = cv2.bitwise_or(mask_np, neck_mask)
 
     # Modest dilation to capture clothing edges
     kernel = np.ones((7, 7), np.uint8)
     mask_dilated = cv2.dilate(mask_np, kernel, iterations=1)
 
     # Re-apply preserve: undo any dilation into skin areas
-    for label in PRESERVE_LABELS:
+    for label in preserve_labels:
         mask_dilated[pred_seg == label] = 0
     # Background must never be in the mask either
     mask_dilated[pred_seg == BACKGROUND_LABEL] = 0
+
+    # Make sure neck mask is fully covered and not zeroed out by background/preserve
+    if lm is not None and neck_mask is not None:
+        mask_dilated = cv2.bitwise_or(mask_dilated, neck_mask)
 
     mask_blurred = cv2.GaussianBlur(mask_dilated, (11, 11), 0)
 
@@ -214,8 +356,201 @@ def compute_color_match(orig_np, result_np, mask_np, sample_band=15):
     return ratio, orig_mean
 
 
+def apply_localized_skin_match(original_pil, result_pil, lm, seg_model, seg_processor, device, garment_type, pred_seg):
+    """
+    Replace global color correction with local skin-tone blending applied only to skin pixels.
+    """
+    orig_np = np.array(original_pil).astype(np.float32)
+    res_np = np.array(result_pil).astype(np.float32)
+    h, w = orig_np.shape[:2]
+
+    # Run SegFormer parser on the synthesized output image to identify skin pixels
+    inputs = processor_safe(seg_processor, result_pil, device)
+    with torch.no_grad():
+        outputs = seg_model(**inputs)
+    upsampled = F.interpolate(outputs.logits, size=(h, w), mode="bilinear", align_corners=False)
+    pred_out = upsampled.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
+
+    # Resize pred_seg if shape doesn't match
+    if pred_seg.shape[0] != h or pred_seg.shape[1] != w:
+        pred_seg_resized = cv2.resize(pred_seg, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        pred_seg_resized = pred_seg
+
+    # Convert res_np to LAB color space
+    res_lab = cv2.cvtColor(res_np.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    # Define zones (Neck, Left Arm, Right Arm, and optionally Legs)
+    zones = []
+
+    # 1. Neck Zone
+    mouth_y = (lm[9].y + lm[10].y) / 2.0
+    nose_y = lm[0].y
+    chin_y = mouth_y + 1.2 * (mouth_y - nose_y)
+    chin_y_px = int(chin_y * h)
+
+    ear_l_x = int(lm[7].x * w)
+    ear_r_x = int(lm[8].x * w)
+    x1 = min(ear_l_x, ear_r_x)
+    x2 = max(ear_l_x, ear_r_x)
+
+    Y_grid, X_grid = np.ogrid[:h, :w]
+    # Neck corridor bounding box/mask
+    neck_zone_mask = (pred_out == 11) & (Y_grid >= chin_y_px) & (X_grid >= x1) & (X_grid <= x2)
+
+    neck_pt_start = np.array([int((lm[9].x + lm[10].x) / 2.0 * w), chin_y_px], dtype=np.float32)
+    neck_pt_end = np.array([
+        int((lm[11].x + lm[12].x) / 2.0 * w),
+        int((lm[11].y + lm[12].y) / 2.0 * h)
+    ], dtype=np.float32)
+
+    zones.append({
+        "name": "Neck",
+        "pt_start": neck_pt_start,
+        "pt_end": neck_pt_end,
+        "label_seg": 11,
+        "label_out": 11,
+        "zone_mask": neck_zone_mask
+    })
+
+    # 2. Left Arm Zone
+    la_pt_start = np.array([lm[15].x * w, lm[15].y * h], dtype=np.float32)
+    la_pt_end = np.array([lm[13].x * w, lm[13].y * h], dtype=np.float32)
+    zones.append({
+        "name": "Left Arm",
+        "pt_start": la_pt_start,
+        "pt_end": la_pt_end,
+        "label_seg": 14,
+        "label_out": 14,
+        "zone_mask": (pred_out == 14)
+    })
+
+    # 3. Right Arm Zone
+    ra_pt_start = np.array([lm[16].x * w, lm[16].y * h], dtype=np.float32)
+    ra_pt_end = np.array([lm[14].x * w, lm[14].y * h], dtype=np.float32)
+    zones.append({
+        "name": "Right Arm",
+        "pt_start": ra_pt_start,
+        "pt_end": ra_pt_end,
+        "label_seg": 15,
+        "label_out": 15,
+        "zone_mask": (pred_out == 15)
+    })
+
+    # 4. Legs Zone (optionally)
+    g_type = garment_type or "upper"
+    if g_type in ["lower", "full"]:
+        # Left Leg
+        ll_pt_start = np.array([lm[27].x * w, lm[27].y * h], dtype=np.float32)
+        ll_pt_end = np.array([lm[25].x * w, lm[25].y * h], dtype=np.float32)
+        zones.append({
+            "name": "Left Leg",
+            "pt_start": ll_pt_start,
+            "pt_end": ll_pt_end,
+            "label_seg": 12,
+            "label_out": 12,
+            "zone_mask": (pred_out == 12)
+        })
+        
+        # Right Leg
+        rl_pt_start = np.array([lm[28].x * w, lm[28].y * h], dtype=np.float32)
+        rl_pt_end = np.array([lm[26].x * w, lm[26].y * h], dtype=np.float32)
+        zones.append({
+            "name": "Right Leg",
+            "pt_start": rl_pt_start,
+            "pt_end": rl_pt_end,
+            "label_seg": 13,
+            "label_out": 13,
+            "zone_mask": (pred_out == 13)
+        })
+
+    for zone in zones:
+        pt_start = zone["pt_start"]
+        pt_end = zone["pt_end"]
+        label_seg = zone["label_seg"]
+        label_out = zone["label_out"]
+        zone_mask = zone["zone_mask"]
+
+        x_s, y_s = int(pt_start[0]), int(pt_start[1])
+
+        # Sample original skin pixels around pt_start (which is preserved, so original)
+        # Using a 30x30 bounding box
+        y1, y2 = max(0, y_s - 15), min(h, y_s + 15)
+        x1_box, x2_box = max(0, x_s - 15), min(w, x_s + 15)
+
+        orig_window = orig_np[y1:y2, x1_box:x2_box]
+        seg_window = pred_seg_resized[y1:y2, x1_box:x2_box]
+        orig_mask = (seg_window == label_seg)
+
+        if orig_mask.sum() > 5:
+            orig_pixels = orig_window[orig_mask]
+        else:
+            orig_pixels = orig_window.reshape(-1, 3)
+
+        # Inpainted skin pixels: sample slightly shifted (15%) towards the elbow/shoulder
+        v = pt_end - pt_start
+        v_norm = np.linalg.norm(v)
+        if v_norm < 1e-3:
+            continue
+        pt_inp = pt_start + 0.15 * v
+        x_i, y_i = int(pt_inp[0]), int(pt_inp[1])
+
+        y1_i, y2_i = max(0, y_i - 15), min(h, y_i + 15)
+        x1_i, x2_i = max(0, x_i - 15), min(w, x_i + 15)
+
+        res_window = res_np[y1_i:y2_i, x1_i:x2_i]
+        out_window = pred_out[y1_i:y2_i, x1_i:x2_i]
+        inp_mask = (out_window == label_out)
+
+        if inp_mask.sum() > 5:
+            inp_pixels = res_window[inp_mask]
+        else:
+            inp_pixels = res_window.reshape(-1, 3)
+
+        # Calculate average channel deltas in LAB space
+        mean_orig_rgb = orig_pixels.mean(axis=0)
+        mean_inp_rgb = inp_pixels.mean(axis=0)
+
+        rgb_orig = np.uint8([[mean_orig_rgb]])
+        rgb_inp = np.uint8([[mean_inp_rgb]])
+        lab_orig = cv2.cvtColor(rgb_orig, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
+        lab_inp = cv2.cvtColor(rgb_inp, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float32)
+
+        dL = lab_orig[0] - lab_inp[0]
+        dA = lab_orig[1] - lab_inp[1]
+        dB = lab_orig[2] - lab_inp[2]
+
+        # Apply a damping factor of 0.8 to dL
+        dL = dL * 0.8
+
+        # Project pixels onto the limb vectors to calculate normalized distance t
+        ys, xs = np.where(zone_mask)
+        if len(ys) > 0:
+            v_x, v_y = v[0], v[1]
+            dot_v_v = v_x * v_x + v_y * v_y
+            if dot_v_v > 0:
+                dx = xs - pt_start[0]
+                dy = ys - pt_start[1]
+                t = (dx * v_x + dy * v_y) / dot_v_v
+                t = np.clip(t, 0.0, 1.0)
+                s = 1.0 - t
+
+                # Apply the delta scaled by s = 1 - t
+                res_lab[ys, xs, 0] += s * dL
+                res_lab[ys, xs, 1] += s * dA
+                res_lab[ys, xs, 2] += s * dB
+
+    # Convert corrected LAB image back to RGB
+    res_lab = np.clip(res_lab, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(res_lab, cv2.COLOR_LAB2RGB)
+    return corrected_rgb.astype(np.float32)
+
+
 def blend_with_face_and_bg_preservation(original_pil, result_pil, soft_mask_np,
-                                        face_mask_np, edge_band=20):
+                                        face_mask_np, edge_band=20,
+                                        use_pose_enhancements=False, lm=None,
+                                        seg_model=None, seg_processor=None, device=None,
+                                        garment_type=None, pred_seg=None):
     """
     Three-layer composite:
       1. face/hair region       -> 100% original
@@ -226,9 +561,14 @@ def blend_with_face_and_bg_preservation(original_pil, result_pil, soft_mask_np,
     orig = np.array(original_pil).astype(np.float32)
     res  = np.array(result_pil).astype(np.float32)
 
-    # 1. Compute color-match correction for boundary pixels
-    ratio, _ = compute_color_match(orig, res, soft_mask_np, sample_band=edge_band)
-    res_color_corrected = np.clip(res * ratio, 0, 255)
+    # 1. Compute color-match correction for boundary pixels / Localized LAB blending
+    if use_pose_enhancements and lm is not None and seg_model is not None:
+        res_color_corrected = apply_localized_skin_match(
+            original_pil, result_pil, lm, seg_model, seg_processor, device, garment_type, pred_seg
+        )
+    else:
+        ratio, _ = compute_color_match(orig, res, soft_mask_np, sample_band=edge_band)
+        res_color_corrected = np.clip(res * ratio, 0, 255)
 
     # 2. Build per-pixel selection map
     alpha = soft_mask_np.astype(np.float32) / 255.0
@@ -310,7 +650,7 @@ def main():
     garment_resized = garment_clean.resize((512, 512), Image.Resampling.LANCZOS)
     person_resized = person_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-    # 4. Human parsing
+    # 4. Human parsing + MediaPipe Pose
     print("[AI] Loading SegFormer human parser...")
     try:
         seg_processor = SegformerImageProcessor.from_pretrained(
@@ -321,15 +661,59 @@ def main():
         print(f"[AI] [ERROR] Failed to load parser: {e}")
         return
 
+    # MediaPipe Pose Initialization
+    use_pose_enhancements = False
+    lm = None
+    if mp_pose is not None:
+        try:
+            print("[AI] Running MediaPipe Pose on person image...")
+            pose = mp_pose.Pose(
+                static_image_mode=True,
+                model_complexity=2,
+                enable_segmentation=False,
+                min_detection_confidence=0.5
+            )
+            person_np = np.array(person_resized)
+            pose_results = pose.process(person_np)
+            pose.close()
+            if pose_results.pose_landmarks:
+                lm = pose_results.pose_landmarks.landmark
+                use_pose_enhancements = True
+                print("[AI] MediaPipe Pose keypoints successfully detected.")
+            else:
+                print("[AI] [WARN] MediaPipe Pose landmarks not detected. Falling back to original behavior.")
+        except Exception as e:
+            print(f"[AI] [WARN] MediaPipe Pose execution failed: {e}. Falling back to original behavior.")
+    else:
+        print("[AI] [WARN] MediaPipe not available. Falling back to original behavior.")
+
+    # Determine PRESERVE_LABELS dynamically
+    if use_pose_enhancements:
+        g_type = args.garment_type or "upper"
+        if g_type == "lower":
+            preserve_labels = {2, 4, 11, 14, 15, 17}
+        elif g_type == "full":
+            preserve_labels = {2, 11}
+        elif g_type == "outer":
+            preserve_labels = {2, 5, 6, 8, 9, 10, 11, 12, 13}
+        else:  # upper
+            preserve_labels = {2, 9, 10, 11, 12, 13}
+        print(f"[AI] Dynamic PRESERVE_LABELS for category '{g_type}': {preserve_labels}")
+    else:
+        preserve_labels = DEFAULT_PRESERVE_LABELS
+        print(f"[AI] Using default PRESERVE_LABELS: {preserve_labels}")
+
     print("[AI] Generating clothing mask and face protect mask...")
     try:
         mask_dilated, mask_blurred, pred_seg = generate_clothing_mask(
             seg_model, seg_processor, person_resized,
-            target_w, target_h, args.garment_type, device)
+            target_w, target_h, args.garment_type, device,
+            preserve_labels=preserve_labels, lm=lm)
         mask_image = Image.fromarray(mask_blurred)
 
         face_mask, _ = build_face_protect_mask(
-            person_resized, seg_model, seg_processor, device, target_w, target_h)
+            person_resized, seg_model, seg_processor, device, target_w, target_h,
+            lm=lm, garment_type=args.garment_type)
 
         # Final mask used by the pipeline: clothing region MINUS face protection
         combined_mask = mask_dilated.copy()
@@ -342,6 +726,7 @@ def main():
         kernel_blend = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask_blend = cv2.dilate(combined_mask, kernel_blend, iterations=1)
         mask_blend[face_mask > 128] = 0
+        mask_blend[pred_seg == BACKGROUND_LABEL] = 0
         print(f"[AI] Inpaint mask: {(combined_mask > 0).sum()} px | "
               f"Face protected: {(face_mask > 128).sum()} px")
     except Exception as e:
@@ -430,7 +815,10 @@ def main():
 
     # 9. Composite with deepfake-style preservation
     final_img = blend_with_face_and_bg_preservation(
-        person_out, result_out, mask_out, face_out, edge_band=20)
+        person_out, result_out, mask_out, face_out, edge_band=20,
+        use_pose_enhancements=use_pose_enhancements, lm=lm,
+        seg_model=seg_model, seg_processor=seg_processor, device=device,
+        garment_type=args.garment_type, pred_seg=pred_seg)
 
     # 10. Optional upscale for sharper clothing texture
     if args.upscale:
