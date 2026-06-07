@@ -227,26 +227,60 @@ function mapKey(k) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 사이즈 추천
-// userBody: { height, weight, shoulderWidth, chest, waist, hip }  (cm)
+// 사이즈 추천 (v2 - 정교화)
+// userBody: { height, weight, shoulderWidth, chest, waist, hip, thigh }  (cm)
+// userBody.fitPreference: 'tight' | 'regular' | 'loose' (사용자 선호)
+// userBody.commonSizes: ['M', 'L'] 등 과거에 잘 맞았던 사이즈 (선택)
 // sizeChart: normalizeSizeChart의 결과
 // garmentType: 'upper' | 'lower' | 'outer' | 'full'
 // ─────────────────────────────────────────────────────────────
+
+// 카테고리별 (1) 비교 부위, (2) 부위별 가중치
+// 한국 쇼핑몰 평균 사이즈 표 기준 어깨가 상의 핏을 가장 좌우
+const CATEGORY_CONFIG = {
+  upper: {
+    keys: ['shoulder', 'chest', 'length'],
+    weights: { shoulder: 0.55, chest: 0.30, length: 0.15, waist: 0.0, hip: 0.0, thigh: 0.0 },
+  },
+  outer: {
+    keys: ['shoulder', 'chest', 'length', 'sleeve'],
+    weights: { shoulder: 0.45, chest: 0.30, length: 0.15, sleeve: 0.10, waist: 0.0, hip: 0.0, thigh: 0.0 },
+  },
+  full: {
+    keys: ['shoulder', 'chest', 'waist', 'hip', 'length'],
+    weights: { shoulder: 0.25, chest: 0.20, waist: 0.20, hip: 0.25, length: 0.10, thigh: 0.0 },
+  },
+  lower: {
+    keys: ['waist', 'hip', 'thigh', 'length'],
+    weights: { waist: 0.40, hip: 0.35, thigh: 0.20, length: 0.05, shoulder: 0.0, chest: 0.0 },
+  },
+};
+
 function recommendSize(userBody, sizeChart, garmentType = 'upper') {
   if (!sizeChart || !sizeChart.sizes || !sizeChart.sizes.length) {
     return { ok: false, error: '사이즈 표가 비어있습니다.' };
   }
 
-  // 비교에 사용할 신체 부위 결정
-  const compareKeys = {
-    upper: ['shoulder', 'chest'],
-    outer: ['shoulder', 'chest'],
-    full:  ['shoulder', 'chest', 'hip'],
-    lower: ['waist', 'hip', 'thigh'],
-  }[garmentType] || ['shoulder', 'chest'];
+  const config = CATEGORY_CONFIG[garmentType] || CATEGORY_CONFIG.upper;
+  const compareKeys = config.keys;
+  const weights = config.weights;
 
-  // 가중치 (어깨가 상의 핏을 가장 크게 좌우)
-  const weights = { shoulder: 0.6, chest: 0.4, waist: 0.4, hip: 0.3, thigh: 0.2, length: 0.1 };
+  // 핏 선호도 마진 (cm)
+  // tight: -2cm, regular: 0, loose: +2cm
+  const fitMargin = {
+    tight:   -2.0,
+    regular:  0.0,
+    loose:    2.0,
+  }[userBody.fitPreference || 'regular'];
+
+  // 어깨너비 1cm 차이의 실제 핏 영향은 부위마다 다름
+  // → "어깨는 1cm이 치수차 대비 더 큰 영향" 이라는 지식 반영
+  // 이건 단순 L1 distance로 충분하지만, 가중치로 처리됨.
+
+  // 과거 사이즈 정보: 있으면 해당 사이즈에 0.5 보너스 (점수 감점)
+  const preferredSizes = new Set(
+    Array.isArray(userBody.commonSizes) ? userBody.commonSizes : []
+  );
 
   let best = null;
   let bestScore = Infinity;
@@ -255,17 +289,32 @@ function recommendSize(userBody, sizeChart, garmentType = 'upper') {
   for (const size of sizeChart.sizes) {
     let diff = 0;
     let used = 0;
+
     for (const k of compareKeys) {
       const m = size.measurements[k];
       const u = userBody[k];
-      if (typeof m === 'number' && typeof u === 'number') {
-        // +1cm 차이는 1점, 음수는 옷이 더 작음(빡빡)
-        diff += weights[k] * Math.abs(m - u);
-        used += weights[k];
-      }
+      if (typeof m !== 'number' || typeof u !== 'number') continue;
+
+      // 핏 선호도를 부위에 따라 분배
+      // 어깨/가슴: 강한 영향, 총장: 약한 영향
+      const regionMultiplier = {
+        shoulder: 1.0, chest: 1.0, waist: 0.9, hip: 0.9,
+        thigh: 0.7, length: 0.3, sleeve: 0.4,
+      }[k] || 1.0;
+      const target = u - fitMargin * regionMultiplier;
+      diff += weights[k] * Math.abs(m - target);
+      used += weights[k];
     }
+
     if (used === 0) continue;
-    const score = diff / used;
+
+    let score = diff / used;
+
+    // 과거 사이즈 보너스: 잘 맞았던 사이즈면 점수 0.5 감점
+    if (preferredSizes.has(size.label)) {
+      score -= 0.5;
+    }
+
     ranked.push({ label: size.label, score, measurements: size.measurements });
     if (score < bestScore) {
       bestScore = score;
@@ -284,19 +333,25 @@ function recommendSize(userBody, sizeChart, garmentType = 'upper') {
   const smaller = idx + 1 < ranked.length ? ranked[idx + 1] : null;
   const larger  = idx > 0 ? ranked[idx - 1] : null;
 
-  // 핏 라벨 (마진 기준)
+  // 핏 라벨 (실제 마진 기준)
   const margin = computeMargin(userBody, best.measurements, compareKeys);
   let fitLabel = '정사이즈';
   let fitDetail = '딱 맞게 떨어지는 핏입니다.';
-  if (margin < -1.5) {
+  if (margin < -2.0) {
     fitLabel = '슬림핏 권장';
-    fitDetail = `어깨/가슴이 평균 ${Math.abs(margin).toFixed(1)}cm 큽니다. 한 사이즈 업을 권장합니다.`;
-  } else if (margin > 2.5) {
-    fitLabel = '루즈핏';
-    fitDetail = `평균 ${margin.toFixed(1)}cm 여유가 있습니다. 오버핏 느낌으로 착용됩니다.`;
-  } else if (margin > 0.5) {
+    fitDetail = `평균 ${Math.abs(margin).toFixed(1)}cm 큽니다. 한 사이즈 업을 권장합니다.`;
+  } else if (margin < -1.0) {
+    fitLabel = '살짝 타이트';
+    fitDetail = `평균 ${Math.abs(margin).toFixed(1)}cm 큽니다. 슬림핏으로 떨어집니다.`;
+  } else if (margin > 4.0) {
+    fitLabel = '오버핏';
+    fitDetail = `평균 ${margin.toFixed(1)}cm 여유. 루즈한 오버핏 느낌입니다.`;
+  } else if (margin > 2.0) {
     fitLabel = '여유핏';
     fitDetail = `평균 ${margin.toFixed(1)}cm 여유. 약간 루즈하게 떨어집니다.`;
+  } else if (margin > 0.5) {
+    fitLabel = '정사이즈 (여유)';
+    fitDetail = `평균 ${margin.toFixed(1)}cm 여유. 일상 착용에 편안합니다.`;
   }
 
   return {
@@ -307,12 +362,18 @@ function recommendSize(userBody, sizeChart, garmentType = 'upper') {
       fitLabel,
       fitDetail,
       score: Number(bestScore.toFixed(2)),
+      marginCm: Number(margin.toFixed(2)),
     },
     alternatives: {
       smaller: smaller ? { label: smaller.label, measurements: smaller.measurements } : null,
       larger:  larger  ? { label: larger.label,  measurements: larger.measurements  } : null,
     },
     ranked: ranked.slice(0, 5).map(r => ({ label: r.label, score: Number(r.score.toFixed(2)) })),
+    debug: {
+      usedKeys: compareKeys,
+      weights,
+      fitPreference: userBody.fitPreference || 'regular',
+    },
   };
 }
 

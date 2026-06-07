@@ -1,11 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, memo } from 'react';
 import {
   StyleSheet, Text, View, TextInput, TouchableOpacity,
   Image, ActivityIndicator, Alert, SafeAreaView, ScrollView,
-  KeyboardAvoidingView, Platform
+  KeyboardAvoidingView, Platform, FlatList
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { Image as ExpoImage } from 'expo-image';
+import { Image as ExpoImage, prefetch } from 'expo-image';
 import axios from 'axios';
 import { preprocessUserPhoto, assessPhotoQuality } from './src/vision/imagePreprocess';
 
@@ -54,7 +54,7 @@ export default function App() {
   const [useUpscale, setUseUpscale] = useState(false);
 
   // ───────── 사진 선택 (EXIF 보정 + 리사이즈) ─────────
-  const pickImage = async () => {
+  const pickImage = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('권한 필요', '사진 라이브러리 접근 권한이 필요합니다.');
@@ -84,10 +84,17 @@ export default function App() {
         Alert.alert('사진 처리 실패', e.message || '이미지를 정규화하지 못했습니다.');
       }
     }
-  };
+  }, []);
+
+  // Prefetch scraped images as soon as they're available so the carousel renders instantly
+  useEffect(() => {
+    if (scrapedImages.length) {
+      prefetch(scrapedImages, 'memory-disk').catch(() => {});
+    }
+  }, [scrapedImages]);
 
   // ───────── 신체 자동 추정 (사진 + 키) ─────────
-  const estimateBody = async () => {
+  const estimateBody = useCallback(async () => {
     if (!userPhotoBase64) return;
     setStep(STEPS.ESTIMATING);
     try {
@@ -123,10 +130,10 @@ export default function App() {
       Alert.alert('오류', '신체 추정 실패: ' + (e.response?.data?.error || e.message));
       setStep(STEPS.INPUT_BODY);
     }
-  };
+  }, [userPhotoBase64, userBody.height]);
 
   // ───────── 쇼핑몰 스크래핑 + 사이즈 표 ─────────
-  const scrapeClothing = async () => {
+  const scrapeClothing = useCallback(async () => {
     if (!shoppingUrl) { Alert.alert('오류', 'URL을 입력해주세요.'); return; }
     setStep(STEPS.SCRAPING);
     try {
@@ -181,10 +188,10 @@ export default function App() {
       Alert.alert('오류', '스크래핑 실패: ' + (error.response?.data?.error || error.message));
       setStep(STEPS.INPUT_URL);
     }
-  };
+  }, [shoppingUrl, userBody]);
 
   // ───────── AI 가상 피팅 ─────────
-  const processVirtualTryOn = async () => {
+  const processVirtualTryOn = useCallback(async () => {
     setStep(STEPS.AI_FITTING);
     try {
       const tryonRes = await axios.post(`${BACKEND_URL}/api/tryon`, {
@@ -217,10 +224,10 @@ export default function App() {
       }
       setStep(STEPS.IMAGE_SELECTION);
     }
-  };
+  }, [userPhotoBase64, selectedClothingImage, garmentDescription, garmentType, fitType, features, useUpscale]);
 
   // ───────── Reset helpers ─────────
-  const resetAll = () => {
+  const resetAll = useCallback(() => {
     setShoppingUrl('');
     setScrapedImages([]);
     setSelectedClothingImage(null);
@@ -229,18 +236,19 @@ export default function App() {
     setSizeRecommendation(null);
     setFinalImage(null);
     setStep(STEPS.INPUT_URL);
-  };
-  const startOver = () => {
+  }, []);
+
+  const startOver = useCallback(() => {
     setUserPhoto(null);
     setUserPhotoBase64('');
     setUserBody({ height: '', weight: '', shoulderWidth: '', chest: '', waist: '', hip: '', thigh: '' });
     setBodyEstimated(false);
     setFinalImage(null);
     setStep(STEPS.SELECT_PHOTO);
-  };
+  }, []);
 
   // ───────── Body helpers ─────────
-  const parseBodyForApi = (b) => {
+  const parseBodyForApi = useCallback((b) => {
     const out = {};
     if (b.height) out.height = parseFloat(b.height);
     if (b.weight) out.weight = parseFloat(b.weight);
@@ -250,9 +258,11 @@ export default function App() {
     if (b.hip)           out.hip     = parseFloat(b.hip);
     if (b.thigh)         out.thigh   = parseFloat(b.thigh);
     return out;
-  };
+  }, []);
 
-  const updateBody = (key, value) => setUserBody(prev => ({ ...prev, [key]: value }));
+  const updateBody = useCallback((key, value) => {
+    setUserBody(prev => ({ ...prev, [key]: value }));
+  }, []);
 
   // ─────────────────────────────────────────────────────────
   //  RENDER
@@ -435,14 +445,26 @@ export default function App() {
             <Text style={styles.title}>합성할 옷 이미지를 선택하세요</Text>
             <Text style={styles.subtitle}>누끼컷(배경 제거된 사진)이 가장 자연스러워요.</Text>
 
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.carousel}>
-              {scrapedImages.map((imgUrl, index) => (
-                <TouchableOpacity key={index} onPress={() => setSelectedClothingImage(imgUrl)}>
-                  <ExpoImage source={{ uri: imgUrl }}
-                    style={[styles.carouselImage, selectedClothingImage === imgUrl && styles.selectedImage]} />
+            <FlatList
+              data={scrapedImages}
+              keyExtractor={(uri, i) => `${i}:${uri}`}
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.carousel}
+              initialNumToRender={4}
+              windowSize={5}
+              removeClippedSubviews
+              renderItem={({ item }) => (
+                <TouchableOpacity onPress={() => setSelectedClothingImage(item)}>
+                  <ExpoImage
+                    source={{ uri: item }}
+                    style={[styles.carouselImage, selectedClothingImage === item && styles.selectedImage]}
+                    contentFit="cover"
+                    cachePolicy="memory-disk"
+                  />
                 </TouchableOpacity>
-              ))}
-            </ScrollView>
+              )}
+            />
 
             <Text style={[styles.title, { marginTop: 24, fontSize: 20 }]}>옷 설명 (AI 프롬프트)</Text>
             <Text style={styles.subtitle}>추출된 정보입니다. 필요시 수정하세요.</Text>
@@ -492,9 +514,9 @@ export default function App() {
         {step === STEPS.AI_FITTING && (
           <View style={styles.centerContainer}>
             <View style={styles.fittingPreview}>
-              <ExpoImage source={{ uri: userPhoto }} style={styles.previewSmall} />
+              <ExpoImage source={{ uri: userPhoto }} style={styles.previewSmall} contentFit="cover" cachePolicy="memory-disk" transition={200} />
               <Text style={styles.plusSign}>+</Text>
-              <ExpoImage source={{ uri: selectedClothingImage }} style={styles.previewSmall} />
+              <ExpoImage source={{ uri: selectedClothingImage }} style={styles.previewSmall} contentFit="cover" cachePolicy="memory-disk" transition={200} />
             </View>
             <ActivityIndicator size="large" color="#FF6B6B" style={{ marginTop: 24 }} />
             <Text style={styles.loadingTitle}>AI가 옷을 입히는 중...</Text>
@@ -509,7 +531,14 @@ export default function App() {
           <View style={styles.resultContainer}>
             <Text style={styles.resultTitle}>✨ 피팅 완료!</Text>
             <View style={styles.resultImageWrap}>
-              <ExpoImage source={{ uri: finalImage }} style={styles.resultImage} contentFit="contain" />
+              <ExpoImage
+                source={{ uri: finalImage }}
+                style={styles.resultImage}
+                contentFit="contain"
+                cachePolicy="memory-disk"
+                transition={400}
+                priority="high"
+              />
             </View>
             <View style={styles.buttonRow}>
               <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={resetAll}>
@@ -527,9 +556,9 @@ export default function App() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Sub-components
+// Sub-components (memoized to prevent re-render storms)
 // ─────────────────────────────────────────────────────────────
-function BodyField({ label, value, onChange, placeholder, optional }) {
+const BodyField = memo(function BodyField({ label, value, onChange, placeholder, optional }) {
   return (
     <View style={styles.bodyField}>
       <Text style={styles.bodyLabel}>{label}{optional ? '' : ' *'}</Text>
@@ -543,9 +572,9 @@ function BodyField({ label, value, onChange, placeholder, optional }) {
       />
     </View>
   );
-}
+});
 
-function SizeTable({ sizeChart }) {
+const SizeTable = memo(function SizeTable({ sizeChart }) {
   if (!sizeChart || !sizeChart.sizes || !sizeChart.sizes.length) return null;
   const allKeys = new Set();
   sizeChart.sizes.forEach(s => Object.keys(s.measurements).forEach(k => allKeys.add(k)));
@@ -566,7 +595,7 @@ function SizeTable({ sizeChart }) {
       ))}
     </View>
   );
-}
+});
 
 const MEASURE_LABEL = {
   shoulder: '어깨', chest: '가슴', sleeve: '소매', length: '총장',

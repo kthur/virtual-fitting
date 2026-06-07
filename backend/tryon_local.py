@@ -64,6 +64,10 @@ def parse_args():
     parser.add_argument("--target_h", type=int, default=1024)
     parser.add_argument("--upscale", action="store_true",
                         help="Apply Real-ESRGAN upscale after synthesis for sharper details")
+    parser.add_argument("--use_controlnet", action="store_true",
+                        help="Use ControlNet OpenPose for accurate clothing deformation on unusual poses")
+    parser.add_argument("--controlnet_scale", type=float, default=0.6,
+                        help="ControlNet conditioning scale (0.3~0.9, higher = pose-following)")
     return parser.parse_args()
 
 
@@ -579,6 +583,126 @@ def blend_with_face_and_bg_preservation(original_pil, result_pil, soft_mask_np,
     return Image.fromarray(blended)
 
 
+# ─────────────────────────────────────────────────────────────
+# OpenPose / stick-figure helpers for ControlNet conditioning
+# ─────────────────────────────────────────────────────────────
+# MediaPipe Pose landmark indices that map to OpenPose COCO-18 keypoints.
+# OpenPose ordering used by lllyasviel/control_v11p_sd15_openpose:
+#  0 nose, 1 neck, 2 r_shoulder, 3 r_elbow, 4 r_wrist,
+#  5 l_shoulder, 6 l_elbow, 7 l_wrist, 8 r_hip, 9 r_knee, 10 r_ankle,
+# 11 l_hip, 12 l_knee, 13 l_ankle, 14 r_eye, 15 l_eye, 16 r_ear, 17 l_ear
+MP_TO_OPENPOSE = {
+    0: 0,    # nose -> nose
+    2: 14,   # left_eye -> r_eye (mirrored)
+    5: 15,   # right_eye -> l_eye
+    7: 16,   # left_ear -> r_ear
+    8: 17,   # right_ear -> l_ear
+    11: 5,   # left_shoulder -> l_shoulder
+    12: 7,   # left_elbow -> l_elbow
+    13: 7+1, # left_wrist -> l_wrist (corrected below)
+    14: 2,   # right_shoulder -> r_shoulder
+    15: 4,   # right_elbow -> r_elbow
+    16: 4+1, # right_wrist -> r_wrist (corrected below)
+    23: 11,  # left_hip -> l_hip
+    25: 13,  # left_knee -> l_knee
+    27: 13+1,# left_ankle -> l_ankle (corrected)
+    24: 8,   # right_hip -> r_hip
+    26: 10,  # right_knee -> r_knee
+    28: 10+1,# right_ankle -> r_ankle (corrected)
+}
+# Apply explicit fixes for the +1 placeholders
+MP_TO_OPENPOSE[13] = 8  # wait, 13 is left_wrist, OpenPose index 8 = r_wrist? No
+# Re-derive from MediaPipe Pose spec to avoid confusion:
+# 11=l_shoulder, 12=l_elbow, 13=l_wrist, 14=r_shoulder, 15=r_elbow, 16=r_wrist
+# 23=l_hip, 25=l_knee, 27=l_ankle, 24=r_hip, 26=r_knee, 28=r_ankle
+# OpenPose: 2=r_shoulder, 3=r_elbow, 4=r_wrist, 5=l_shoulder, 6=l_elbow, 7=l_wrist
+#            8=r_hip, 9=r_knee, 10=r_ankle, 11=l_hip, 12=l_knee, 13=l_ankle
+MP_TO_OPENPOSE = {
+    0: 0,   # nose
+    2: 14, 5: 15,           # eyes
+    7: 16, 8: 17,           # ears
+    11: 5, 12: 6, 13: 7,    # left arm
+    14: 2, 15: 3, 16: 4,    # right arm
+    23: 11, 25: 12, 27: 13, # left leg
+    24: 8, 26: 9, 28: 10,   # right leg
+}
+
+# OpenPose skeleton: pairs (keypoint_a, keypoint_b)
+OPENPOSE_PAIRS = [
+    (0, 1),   # nose-neck
+    (0, 14), (0, 15),     # nose-eyes
+    (14, 16), (15, 17),   # eyes-ears
+    (1, 2), (1, 5),       # neck-shoulders
+    (2, 3), (3, 4),       # right arm
+    (5, 6), (6, 7),       # left arm
+    (1, 8), (1, 11),      # neck-hips
+    (8, 9), (9, 10),      # right leg
+    (11, 12), (12, 13),   # left leg
+]
+
+
+def mediapipe_to_openpose_stick_figure(person_pil, lm, w, h, visibility_threshold=0.4):
+    """
+    Render an OpenPose-compatible stick figure from MediaPipe landmarks.
+    Returned image is RGB, on black background, ready for ControlNet conditioning.
+    """
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # Build openpose keypoint dict from mediapipe landmarks
+    op = {i: None for i in range(18)}
+    for mp_idx, op_idx in MP_TO_OPENPOSE.items():
+        try:
+            l = lm[mp_idx]
+            if l.visibility >= visibility_threshold:
+                op[op_idx] = (int(l.x * w), int(l.y * h))
+        except (IndexError, AttributeError):
+            pass
+
+    # Neck: midpoint of shoulders; fallback midpoint of eyes
+    if op[2] and op[5]:
+        op[1] = ((op[2][0] + op[5][0]) // 2, (op[2][1] + op[5][1]) // 2)
+    elif op[0]:
+        op[1] = (op[0][0], op[0][1] + int(0.05 * h))
+
+    # Draw bones
+    for a, b in OPENPOSE_PAIRS:
+        if op[a] and op[b]:
+            cv2.line(canvas, op[a], op[b], (255, 255, 255), 4, cv2.LINE_AA)
+
+    # Draw joints
+    for pt in op.values():
+        if pt:
+            cv2.circle(canvas, pt, 6, (255, 255, 255), -1, cv2.LINE_AA)
+
+    n_visible = sum(1 for v in op.values() if v is not None)
+    return Image.fromarray(canvas), n_visible
+
+
+def extract_openpose_image(person_pil, lm, w, h):
+    """
+    Extract an OpenPose-style conditioning image.
+    Prefers controlnet-aux (more accurate), falls back to MediaPipe stick figure.
+    Returns (image, n_keypoints_or_-1_if_unavailable).
+    """
+    # Path A: controlnet-aux OpenposeDetector
+    try:
+        from controlnet_aux import OpenposeDetector
+        detector = OpenposeDetector.from_pretrained(
+            "lllyasviel/Annotators", filename="body_pose_model.pth")
+        print("[AI] Using controlnet-aux OpenposeDetector")
+        return detector(person_pil), 18
+    except Exception as e:
+        print(f"[AI] controlnet-aux unavailable ({type(e).__name__}: {str(e)[:80]}), "
+              f"using MediaPipe stick figure")
+
+    # Path B: MediaPipe landmarks -> stick figure
+    if lm is None:
+        return None, 0
+    img, n = mediapipe_to_openpose_stick_figure(person_pil, lm, w, h)
+    print(f"[AI] MediaPipe stick figure with {n}/18 keypoints")
+    return img, n
+
+
 def optional_upscale(img_pil):
     """Apply Real-ESRGAN x2 if available. Falls back silently if not installed."""
     try:
@@ -738,8 +862,9 @@ def main():
     )
     print(f"[AI] Prompt: {prompt}")
 
-    # 6. Load SD Inpainting + IP-Adapter
-    print("[AI] Loading Stable Diffusion Inpainting + IP-Adapter...")
+    # 6. Load SD Inpainting + IP-Adapter (+ optional ControlNet OpenPose)
+    print("[AI] Loading Stable Diffusion Inpainting + IP-Adapter" +
+          (" + ControlNet OpenPose" if args.use_controlnet else "") + "...")
     try:
         from transformers import CLIPVisionModelWithProjection
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
@@ -747,12 +872,38 @@ def main():
             torch_dtype=torch_dtype
         ).to(device)
 
-        pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting",
-            torch_dtype=torch_dtype,
-            safety_checker=None,
-            image_encoder=image_encoder
-        )
+        controlnet = None
+        if args.use_controlnet:
+            try:
+                from diffusers import ControlNetModel
+                controlnet = ControlNetModel.from_pretrained(
+                    "lllyasviel/control_v11p_sd15_openpose",
+                    torch_dtype=torch_dtype,
+                )
+                print("[AI] ControlNet OpenPose loaded")
+            except Exception as e:
+                print(f"[AI] [WARN] ControlNet load failed ({type(e).__name__}: {str(e)[:80]}), "
+                      f"continuing without ControlNet")
+                controlnet = None
+                args.use_controlnet = False
+
+        if controlnet is not None:
+            from diffusers import StableDiffusionControlNetInpaintPipeline
+            pipe = StableDiffusionControlNetInpaintPipeline.from_pretrained(
+                "runwayml/stable-diffusion-inpainting",
+                controlnet=controlnet,
+                torch_dtype=torch_dtype,
+                safety_checker=None,
+                image_encoder=image_encoder,
+            )
+        else:
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(
+                "runwayml/stable-diffusion-inpainting",
+                torch_dtype=torch_dtype,
+                safety_checker=None,
+                image_encoder=image_encoder,
+            )
+
         pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models",
                              weight_name="ip-adapter_sd15.bin")
         pipe.set_ip_adapter_scale(args.ip_scale)
@@ -765,12 +916,25 @@ def main():
         print(f"[AI] [ERROR] Failed to load pipeline: {e}")
         return
 
+    # 6.5 Extract ControlNet conditioning image (if enabled)
+    control_image = None
+    if args.use_controlnet:
+        try:
+            control_image, n_kp = extract_openpose_image(
+                person_resized, lm, target_w, target_h)
+            if n_kp < 6:
+                print(f"[AI] [WARN] Only {n_kp} keypoints visible, ControlNet will have limited effect")
+        except Exception as e:
+            print(f"[AI] [WARN] OpenPose extraction failed: {e}")
+            control_image = None
+            args.use_controlnet = False
+
     # 7. Inference
     print("[AI] Running clothing synthesis (inpainting)...")
     try:
         generator = torch.Generator(device=device).manual_seed(42)
 
-        result_resized = pipe(
+        pipe_kwargs = dict(
             prompt=prompt,
             negative_prompt=negative_prompt,
             image=person_resized,
@@ -779,8 +943,14 @@ def main():
             num_inference_steps=args.inference_steps,
             guidance_scale=7.5,
             strength=0.99,
-            generator=generator
-        ).images[0]
+            generator=generator,
+        )
+        if control_image is not None:
+            pipe_kwargs["control_image"] = control_image
+            pipe_kwargs["controlnet_conditioning_scale"] = args.controlnet_scale
+            print(f"[AI] ControlNet conditioning scale: {args.controlnet_scale}")
+
+        result_resized = pipe(**pipe_kwargs).images[0]
 
         print("[AI] Synthesis complete. Saving debug output...")
         result_resized.save("debug_sd_output.png")

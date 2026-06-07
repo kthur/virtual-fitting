@@ -11,6 +11,12 @@ const VENV_PYTHON = path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe');
 
 const { determineGarmentType, extractFeatures } = require('./helpers');
 const sizeScraper = require('./size_scraper');
+const SimpleLRU = require('./cache');
+
+// Per-endpoint caches (URL-keyed)
+const scrapeCache       = new SimpleLRU(200, 10 * 60 * 1000);   // 10 min
+const sizeChartCache    = new SimpleLRU(200, 30 * 60 * 1000);   // 30 min
+const recommendCache    = new SimpleLRU(200, 30 * 60 * 1000);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,7 +27,21 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Basic health check
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({
+    status: 'ok',
+    cache: {
+      scrape:    scrapeCache.stats,
+      sizeChart: sizeChartCache.stats,
+      recommend: recommendCache.stats,
+    },
+  });
+});
+
+app.post('/api/cache/clear', (req, res) => {
+  scrapeCache.clear();
+  sizeChartCache.clear();
+  recommendCache.clear();
+  res.json({ ok: true });
 });
 
 // Scraper endpoint
@@ -29,6 +49,14 @@ app.post('/api/scrape', async (req, res) => {
   const { url } = req.body;
   if (!url) {
     return res.status(400).json({ error: 'URL is required' });
+  }
+
+  // Cache hit: same URL scraped within TTL → return immediately
+  const cacheKey = `scrape:${url}`;
+  const cached = scrapeCache.get(cacheKey);
+  if (cached) {
+    console.log(`[Server] scrape cache HIT: ${url}`);
+    return res.json({ ...cached, _cached: true });
   }
 
   try {
@@ -95,7 +123,9 @@ app.post('/api/scrape', async (req, res) => {
     console.log(`[Server] Product: ${garmentDescription}`);
     console.log(`[Server] Features: colors='${features.colors}' materials='${features.materials}' styles='${features.styles}'`);
 
-    res.json({ imageUrls, garmentDescription, garmentType, features, sourceUrl: url });
+    const payload = { imageUrls, garmentDescription, garmentType, features, sourceUrl: url };
+    scrapeCache.set(cacheKey, payload);
+    res.json(payload);
 
   } catch (error) {
     console.error('Scraping error:', error.message);
@@ -113,6 +143,13 @@ app.post('/api/scrape-size', async (req, res) => {
     return res.status(400).json({ error: 'URL is required' });
   }
 
+  const cacheKey = `size:${url}:${garmentType || 'upper'}`;
+  const cached = sizeChartCache.get(cacheKey);
+  if (cached) {
+    console.log(`[Server] sizeChart cache HIT: ${url}`);
+    return res.json({ ...cached, _cached: true });
+  }
+
   try {
     const mall = sizeScraper.detectMall(url);
     if (!mall) {
@@ -126,7 +163,9 @@ app.post('/api/scrape-size', async (req, res) => {
     else if (mall === 'zigzag') chart = await sizeScraper.scrapeZigzagSize(url);
     else if (mall === '29cm')  chart = await sizeScraper.scrape29cmSize(url);
 
-    res.json({ mall, url, garmentType: garmentType || 'upper', sizeChart: chart });
+    const payload = { mall, url, garmentType: garmentType || 'upper', sizeChart: chart };
+    sizeChartCache.set(cacheKey, payload);
+    res.json(payload);
   } catch (error) {
     console.error('Size scraping error:', error.message);
     res.status(500).json({ error: '사이즈 표를 가져오지 못했습니다: ' + error.message });
@@ -142,8 +181,17 @@ app.post('/api/recommend-size', async (req, res) => {
   if (!url)      return res.status(400).json({ error: 'URL is required' });
   if (!userBody) return res.status(400).json({ error: 'userBody is required' });
 
+  const bodyKey = JSON.stringify(userBody);
+  const cacheKey = `rec:${url}:${garmentType || 'upper'}:${bodyKey}`;
+  const cached = recommendCache.get(cacheKey);
+  if (cached) {
+    console.log(`[Server] recommend cache HIT: ${url}`);
+    return res.json({ ...cached, _cached: true });
+  }
+
   try {
     const result = await sizeScraper.fetchAndRecommend(url, userBody, garmentType || 'upper');
+    recommendCache.set(cacheKey, result);
     res.json(result);
   } catch (error) {
     console.error('Recommend size error:', error.message);
@@ -207,7 +255,8 @@ app.post('/api/tryon', async (req, res) => {
   const {
     userImageBase64, clothingImageUrl,
     garmentDescription, garmentType, fitType, features,
-    ipScale, inferenceSteps, upscale
+    ipScale, inferenceSteps, upscale,
+    useControlnet, controlnetScale
   } = req.body;
   if (!userImageBase64 || !clothingImageUrl) {
     return res.status(400).json({ error: 'Missing required images.' });
@@ -256,6 +305,10 @@ app.post('/api/tryon', async (req, res) => {
     if (ipScale !== undefined && ipScale !== null)        args.push('--ip_scale', String(ipScale));
     if (inferenceSteps !== undefined && inferenceSteps)   args.push('--inference_steps', String(inferenceSteps));
     if (upscale) args.push('--upscale');
+    if (useControlnet) args.push('--use_controlnet');
+    if (controlnetScale !== undefined && controlnetScale !== null) {
+      args.push('--controlnet_scale', String(controlnetScale));
+    }
 
     const pythonProcess = spawn(VENV_PYTHON, args, {
       cwd: __dirname,
