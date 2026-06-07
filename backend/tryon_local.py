@@ -162,16 +162,10 @@ def build_face_protect_mask(person_pil, seg_model, seg_processor, device, w, h, 
         chin_y = mouth_y + 1.2 * (mouth_y - nose_y)
         chin_y_px = int(chin_y * h)
         
-        # Zero out the face mask below chin_y_px within the neck corridor (between ear X)
-        ear_l_x = int(lm[7].x * w)
-        ear_r_x = int(lm[8].x * w)
-        x1 = min(ear_l_x, ear_r_x)
-        x2 = max(ear_l_x, ear_r_x)
-        
-        x1_clip = max(0, x1)
-        x2_clip = min(w, x2)
+        # Zero out the face mask below chin_y_px globally
         chin_y_clip = max(0, min(h, chin_y_px))
-        face_mask[chin_y_clip:, x1_clip:x2_clip] = 0
+        face_mask[chin_y_clip:, :] = 0
+        face_mask[pred == 2] = 255  # Protect hair below chin
         
         g_type = garment_type or "upper"
         # Hand protection (for 'upper', 'outer', 'full')
