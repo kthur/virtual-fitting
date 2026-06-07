@@ -1,18 +1,21 @@
-import React, { useState, useCallback, useEffect, useMemo, memo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, memo, useRef } from 'react';
 import {
   StyleSheet, Text, View, TextInput, TouchableOpacity,
   Image, ActivityIndicator, Alert, SafeAreaView, ScrollView,
   KeyboardAvoidingView, Platform, FlatList
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Image as ExpoImage, prefetch } from 'expo-image';
 import axios from 'axios';
 import { preprocessUserPhoto, assessPhotoQuality } from './src/vision/imagePreprocess';
+import { parseCameraCalibration, computeCalibration } from './src/vision/cameraCalibrate';
 
 const BACKEND_URL = 'http://192.168.31.231:3000';
 
 const STEPS = {
   SELECT_PHOTO: 'SELECT_PHOTO',
+  CAMERA:       'CAMERA',
   INPUT_BODY:   'INPUT_BODY',
   ESTIMATING:   'ESTIMATING',
   INPUT_URL:    'INPUT_URL',
@@ -53,6 +56,12 @@ export default function App() {
   const [finalImage, setFinalImage] = useState(null);
   const [useUpscale, setUseUpscale] = useState(false);
 
+  // 카메라
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const [cameraCalibration, setCameraCalibration] = useState(null);
+  const [cameraReady, setCameraReady] = useState(false);
+  const cameraRef = useRef(null);
+
   // ───────── 사진 선택 (EXIF 보정 + 리사이즈) ─────────
   const pickImage = useCallback(async () => {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -86,6 +95,45 @@ export default function App() {
     }
   }, []);
 
+  // ───────── 카메라 촬영 ─────────
+  const takeCameraPhoto = useCallback(async () => {
+    if (!cameraPermission?.granted) {
+      const { status } = await ImagePicker.requestCameraPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('권한 필요', '카메라 접근 권한이 필요합니다.');
+        return;
+      }
+    }
+    setStep(STEPS.CAMERA);
+  }, [cameraPermission]);
+
+  const handleCameraCapture = useCallback(async () => {
+    if (!cameraRef.current) return;
+    setCameraReady(false);
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.7 });
+      if (!photo?.uri) { Alert.alert('오류', '사진을 찍지 못했습니다.'); return; }
+
+      const cal = await parseCameraCalibration(photo.uri);
+      setCameraCalibration(cal.available ? cal : null);
+
+      const processed = await preprocessUserPhoto(photo.uri);
+      setUserPhoto(processed.uri);
+      setUserPhotoBase64(processed.dataUri);
+      setPhotoQuality(processed.quality);
+
+      if (processed.quality.issues.length) {
+        const hard = processed.quality.issues.find(i => i.severity === 'warn');
+        if (hard) Alert.alert('사진 품질 안내', hard.message, [{ text: '계속' }]);
+      }
+      setStep(STEPS.INPUT_BODY);
+    } catch (e) {
+      Alert.alert('사진 처리 실패', e.message || '카메라 사진을 처리하지 못했습니다.');
+    } finally {
+      setCameraReady(true);
+    }
+  }, []);
+
   // Prefetch scraped images as soon as they're available so the carousel renders instantly
   useEffect(() => {
     if (scrapedImages.length) {
@@ -93,14 +141,28 @@ export default function App() {
     }
   }, [scrapedImages]);
 
-  // ───────── 신체 자동 추정 (사진 + 키) ─────────
+  // ───────── 신체 자동 추정 (사진 + 키 + EXIF 보정) ─────────
   const estimateBody = useCallback(async () => {
     if (!userPhotoBase64) return;
     setStep(STEPS.ESTIMATING);
+
+    let camera = null;
+    if (cameraCalibration?.available) {
+      camera = computeCalibration(
+        cameraCalibration,
+        photoQuality?.width || 0,
+        photoQuality?.height || 0,
+        0,
+        userBody.height ? parseFloat(userBody.height) : null,
+        true,
+      );
+    }
+
     try {
       const res = await axios.post(`${BACKEND_URL}/api/estimate-body`, {
         userImageBase64: userPhotoBase64,
         knownHeightCm: userBody.height ? parseFloat(userBody.height) : null,
+        cameraCalibration: camera,
       }, { timeout: 60000, headers: { 'Bypass-Tunnel-Reminder': 'true' } });
 
       if (!res.data.ok) {
@@ -130,7 +192,7 @@ export default function App() {
       Alert.alert('오류', '신체 추정 실패: ' + (e.response?.data?.error || e.message));
       setStep(STEPS.INPUT_BODY);
     }
-  }, [userPhotoBase64, userBody.height]);
+  }, [userPhotoBase64, userBody.height, cameraCalibration, photoQuality]);
 
   // ───────── 쇼핑몰 스크래핑 + 사이즈 표 ─────────
   const scrapeClothing = useCallback(async () => {
@@ -277,10 +339,44 @@ export default function App() {
             <Text style={styles.emoji}>👗</Text>
             <Text style={styles.title}>Virtual Fitting AI</Text>
             <Text style={styles.subtitle}>내 전신 또는 상반신 사진을 선택하면{'\n'}AI가 옷을 입혀드립니다</Text>
-            <TouchableOpacity style={styles.button} onPress={pickImage}>
-              <Text style={styles.buttonText}>📸 사진 선택</Text>
+            <TouchableOpacity style={[styles.button, { marginBottom: 12 }]} onPress={takeCameraPhoto}>
+              <Text style={styles.buttonText}>📷 카메라로 촬영</Text>
             </TouchableOpacity>
-            <Text style={styles.tip}>💡 정면 전신/상반신 사진이 가장 좋습니다</Text>
+            <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={pickImage}>
+              <Text style={styles.buttonText}>🖼️ 갤러리에서 선택</Text>
+            </TouchableOpacity>
+            <Text style={styles.tip}>💡 카메라 촬영 시 EXIF 초점거리로 더 정확한 사이즈 추정</Text>
+          </View>
+        )}
+
+        {/* ───── STEP 1.5: 카메라 뷰 ───── */}
+        {step === STEPS.CAMERA && (
+          <View style={{ flex: 1 }}>
+            <CameraView
+              ref={cameraRef}
+              style={{ flex: 1 }}
+              facing="front"
+              onCameraReady={() => setCameraReady(true)}
+            >
+              <View style={{ flex: 1, justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 60 }}>
+                <TouchableOpacity
+                  style={{
+                    width: 80, height: 80, borderRadius: 40,
+                    backgroundColor: '#fff', borderWidth: 4, borderColor: '#4D96FF',
+                    alignItems: 'center', justifyContent: 'center',
+                  }}
+                  onPress={handleCameraCapture}
+                >
+                  <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: '#fff' }} />
+                </TouchableOpacity>
+              </View>
+            </CameraView>
+            <TouchableOpacity
+              style={[styles.button, styles.secondaryButton, { position: 'absolute', top: 50, left: 20 }]}
+              onPress={() => setStep(STEPS.SELECT_PHOTO)}
+            >
+              <Text style={styles.buttonText}>← 취소</Text>
+            </TouchableOpacity>
           </View>
         )}
 
@@ -290,7 +386,13 @@ export default function App() {
             <ExpoImage source={{ uri: userPhoto }} style={styles.thumbnail} />
             {photoQuality && (
               <Text style={styles.photoMeta}>
-                📐 {photoQuality.width}×{photoQuality.height} px · EXIF 보정됨
+                📐 {photoQuality.width}×{photoQuality.height} px
+                {cameraCalibration?.available && (
+                  <Text> · 📷 초점 {cameraCalibration.focalLength35mm}mm
+                    {cameraCalibration.isWideAngle && <Text style={{ color: '#FFB347' }}> (광각)</Text>}
+                  </Text>
+                )}
+                {!cameraCalibration?.available && <Text> · EXIF 보정됨</Text>}
                 {photoQuality.issues.length > 0 && (
                   <Text style={{ color: '#FFB347' }}> · {photoQuality.issues[0].message}</Text>
                 )}

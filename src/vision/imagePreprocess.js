@@ -1,8 +1,8 @@
 import * as ImageManipulator from 'expo-image-manipulator';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 
-const MIN_SHORT_EDGE = 512;     // 짧은 변 최소 픽셀 (AI 합성 품질 보장)
-const MAX_LONG_EDGE  = 1600;    // 긴 변 최대 픽셀 (전송 부담 방지)
+const MIN_SHORT_EDGE = 512;
+const MAX_LONG_EDGE  = 1600;
 const JPEG_QUALITY   = 0.82;
 
 /**

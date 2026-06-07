@@ -42,6 +42,16 @@ def parse_args():
                         help="Optional: real height in cm. If provided, returns measurements in cm.")
     parser.add_argument("--known_weight_kg", type=float, default=None,
                         help="Optional: real weight in kg. Improves chest/waist/thigh estimation.")
+    parser.add_argument("--camera_focal_length_35mm", type=float, default=None,
+                        help="EXIF FocalLengthIn35mmFilm for perspective-aware calibration")
+    parser.add_argument("--camera_vfov", type=float, default=None,
+                        help="Vertical field of view in radians")
+    parser.add_argument("--camera_hfov", type=float, default=None,
+                        help="Horizontal field of view in radians")
+    parser.add_argument("--camera_distance_cm", type=float, default=None,
+                        help="Camera-to-subject distance in cm (computed on frontend)")
+    parser.add_argument("--camera_method", type=str, default=None,
+                        help="Calibration method tag")
     return parser.parse_args()
 
 
@@ -241,23 +251,56 @@ def main():
     shoulder_asym = l_r_asym(dist2(L_SH, R_SH), dist2(L_SH, R_SH))
     hip_asym = l_r_asym(dist2(L_HIP, R_HIP), dist2(L_HIP, R_HIP))
 
-    # ── Convert px → cm using known height (if provided) ──
+    # ── Convert px → cm using known height + camera calibration (if available) ──
     measurements_cm = None
     px_per_cm = None
     confidence = "high"
+    calibration_method = None
 
     if args.known_height_cm and body_height_px > 0:
-        px_per_cm = body_height_px / args.known_height_cm
+        m = {}
 
-        # Raw measurements
-        m = {
-            "shoulderWidth": shoulder_px / px_per_cm,
-            "hipWidth":      hip_px      / px_per_cm,
-            "torsoLength":   torso_px    / px_per_cm,
-            "armLength":     arm_px      / px_per_cm,
-            "legLength":     leg_px      / px_per_cm,
-            "thighLength":   thigh_px    / px_per_cm,
-        }
+        # Perspective-aware conversion when EXIF camera FOV is available
+        use_perspective = (
+            args.camera_vfov and args.camera_hfov
+            and args.camera_vfov > 0 and args.camera_hfov > 0
+        )
+
+        if use_perspective:
+            angular_height = args.camera_vfov * body_height_px / h
+            if abs(math.tan(angular_height / 2)) > 1e-10:
+                distance_cm = args.known_height_cm / (2 * math.tan(angular_height / 2))
+                distance_cm = max(distance_cm, 30)  # sanity clamp
+
+                def px_to_cm_h(px_w):
+                    return 2 * distance_cm * math.tan(args.camera_hfov * px_w / (2 * w))
+
+                def px_to_cm_v(px_h):
+                    return 2 * distance_cm * math.tan(args.camera_vfov * px_h / (2 * h))
+
+                m["shoulderWidth"] = px_to_cm_h(shoulder_px)
+                m["hipWidth"]      = px_to_cm_h(hip_px)
+                m["torsoLength"]   = px_to_cm_v(torso_px)
+                m["armLength"]     = px_to_cm_v(arm_px)
+                m["legLength"]     = px_to_cm_v(leg_px)
+                m["thighLength"]   = px_to_cm_v(thigh_px)
+                calibration_method = "perspective"
+            else:
+                use_perspective = False
+
+        if not use_perspective:
+            # Fallback: simple linear ratio (current approach)
+            px_per_cm = body_height_px / args.known_height_cm
+
+            m = {
+                "shoulderWidth": shoulder_px / px_per_cm,
+                "hipWidth":      hip_px      / px_per_cm,
+                "torsoLength":   torso_px    / px_per_cm,
+                "armLength":     arm_px      / px_per_cm,
+                "legLength":     leg_px      / px_per_cm,
+                "thighLength":   thigh_px    / px_per_cm,
+            }
+            calibration_method = "simple_ratio"
 
         # Apply prior regularization (Bayesian-style shrinkage)
         if posture["facing_camera"] and posture["ankles_visible"]:
@@ -275,8 +318,6 @@ def main():
         # Estimate chest/waist from weight if provided (BMI + heuristics)
         if args.known_weight_kg and args.known_height_cm:
             bmi = args.known_weight_kg / ((args.known_height_cm / 100) ** 2)
-            # Rough chest/waist/thigh estimates based on Korean averages
-            # These are educated guesses, not medical measurements
             m["chest"]   = round(m["shoulderWidth"] * 1.45 + (bmi - 22) * 0.5, 1)
             m["waist"]   = round(m["hipWidth"] * 1.05 + (bmi - 22) * 0.8, 1)
             m["thighCircumference"] = round(m["thighLength"] * 0.55 + (bmi - 22) * 0.3, 1)
@@ -322,6 +363,12 @@ def main():
     if px_per_cm is not None:
         out["knownHeightCm"] = args.known_height_cm
         out["pxPerCm"] = round(px_per_cm, 4)
+    if calibration_method:
+        out["calibrationMethod"] = calibration_method
+    if args.camera_focal_length_35mm:
+        out["cameraFocalLength35mm"] = args.camera_focal_length_35mm
+        out["cameraHfov"] = args.camera_hfov
+        out["cameraVfov"] = args.camera_vfov
     if args.known_weight_kg:
         out["knownWeightKg"] = args.known_weight_kg
 
