@@ -204,7 +204,7 @@ app.post('/api/recommend-size', async (req, res) => {
 // body: { userImageBase64, knownHeightCm? }
 // ─────────────────────────────────────────────────────────────────
 app.post('/api/estimate-body', async (req, res) => {
-  const { userImageBase64, knownHeightCm, cameraCalibration } = req.body;
+  const { userImageBase64, knownHeightCm, cameraExif } = req.body;
   if (!userImageBase64) {
     return res.status(400).json({ error: 'userImageBase64 is required' });
   }
@@ -219,23 +219,13 @@ app.post('/api/estimate-body', async (req, res) => {
     const args = [scriptPath, '--image_path', tempUserPath];
     if (knownHeightCm) args.push('--known_height_cm', String(knownHeightCm));
 
-    // Pass EXIF camera calibration for perspective-aware measurements
-    if (cameraCalibration && cameraCalibration.method === 'perspective') {
-      if (cameraCalibration.focalLength35mm) {
-        args.push('--camera_focal_length_35mm', String(cameraCalibration.focalLength35mm));
+    // Pass RAW EXIF data — server detects person height, computes distance
+    if (cameraExif && cameraExif.hfov != null && cameraExif.vfov != null) {
+      if (cameraExif.focalLength35mm) {
+        args.push('--camera_focal_length_35mm', String(cameraExif.focalLength35mm));
       }
-      if (cameraCalibration.hfov != null) {
-        args.push('--camera_hfov', String(cameraCalibration.hfov));
-      }
-      if (cameraCalibration.vfov != null) {
-        args.push('--camera_vfov', String(cameraCalibration.vfov));
-      }
-      if (cameraCalibration.distanceCm) {
-        args.push('--camera_distance_cm', String(cameraCalibration.distanceCm));
-      }
-      if (cameraCalibration.method) {
-        args.push('--camera_method', cameraCalibration.method);
-      }
+      args.push('--camera_hfov', String(cameraExif.hfov));
+      args.push('--camera_vfov', String(cameraExif.vfov));
     }
 
     const { spawn } = require('child_process');

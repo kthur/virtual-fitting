@@ -9,7 +9,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Image as ExpoImage, prefetch } from 'expo-image';
 import axios from 'axios';
 import { preprocessUserPhoto, assessPhotoQuality } from './src/vision/imagePreprocess';
-import { parseCameraCalibration, computeCalibration } from './src/vision/cameraCalibrate';
+import { parseCameraCalibration } from './src/vision/cameraCalibrate';
 
 const BACKEND_URL = 'http://192.168.31.231:3000';
 
@@ -77,6 +77,10 @@ export default function App() {
     });
     if (!result.canceled) {
       try {
+        // EXIF 파싱 (갤러리 사진도 EXIF 보유 시 초점거리 활용)
+        const cal = await parseCameraCalibration(result.assets[0].uri);
+        setCameraCalibration(cal.available ? cal : null);
+
         const processed = await preprocessUserPhoto(result.assets[0].uri);
         setUserPhoto(processed.uri);
         setUserPhotoBase64(processed.dataUri);
@@ -146,23 +150,21 @@ export default function App() {
     if (!userPhotoBase64) return;
     setStep(STEPS.ESTIMATING);
 
-    let camera = null;
-    if (cameraCalibration?.available) {
-      camera = computeCalibration(
-        cameraCalibration,
-        photoQuality?.width || 0,
-        photoQuality?.height || 0,
-        0,
-        userBody.height ? parseFloat(userBody.height) : null,
-        true,
-      );
-    }
+    // RAW EXIF 데이터를 백엔드에 전달 (서버가 person height 직접 측정)
+    const cameraExif = cameraCalibration?.available
+      ? {
+          focalLength35mm: cameraCalibration.focalLength35mm,
+          hfov: cameraCalibration.hfov,
+          vfov: cameraCalibration.vfov,
+          isWideAngle: cameraCalibration.isWideAngle ?? false,
+        }
+      : null;
 
     try {
       const res = await axios.post(`${BACKEND_URL}/api/estimate-body`, {
         userImageBase64: userPhotoBase64,
         knownHeightCm: userBody.height ? parseFloat(userBody.height) : null,
-        cameraCalibration: camera,
+        cameraExif,
       }, { timeout: 60000, headers: { 'Bypass-Tunnel-Reminder': 'true' } });
 
       if (!res.data.ok) {
@@ -192,7 +194,7 @@ export default function App() {
       Alert.alert('오류', '신체 추정 실패: ' + (e.response?.data?.error || e.message));
       setStep(STEPS.INPUT_BODY);
     }
-  }, [userPhotoBase64, userBody.height, cameraCalibration, photoQuality]);
+  }, [userPhotoBase64, userBody.height, cameraCalibration]);
 
   // ───────── 쇼핑몰 스크래핑 + 사이즈 표 ─────────
   const scrapeClothing = useCallback(async () => {
